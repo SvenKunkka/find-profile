@@ -145,6 +145,104 @@ body {
   font-size: 12px;
 }
 
+.roots-list {
+  list-style: none;
+  margin: 0;
+  padding: 4px 0;
+  overflow-y: auto;
+}
+
+.root-item {
+  padding: 6px 12px;
+  border-bottom: 1px solid #f0f0f3;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.root-path {
+  font-size: 12px;
+  color: #1c1c1e;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+}
+
+.root-meta {
+  display: flex;
+  gap: 6px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.root-kind,
+.root-status {
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid transparent;
+}
+
+.root-kind {
+  background: #e8eef9;
+  color: #0a4ea1;
+  border-color: #c7d8f0;
+}
+
+.root-kind.kind-nas {
+  background: #efe7f7;
+  color: #5b3a8c;
+  border-color: #d8c7ef;
+}
+
+.root-status.status-available {
+  background: #e6f4ea;
+  color: #1e7d32;
+  border-color: #c4e3cd;
+}
+
+.root-status.status-disconnected {
+  background: #fff4e0;
+  color: #8a5a00;
+  border-color: #f1d9a8;
+}
+
+.root-status.status-scanning {
+  background: #e8f1ff;
+  color: #0a4ea1;
+  border-color: #c7d8f0;
+}
+
+.root-status.status-error {
+  background: #fde7e7;
+  color: #a31515;
+  border-color: #f1c4c4;
+}
+
+.status-error {
+  color: #a31515;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.status-dismiss {
+  font: inherit;
+  font-size: 14px;
+  line-height: 1;
+  border: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  padding: 0 4px;
+}
+
+.status-dismiss:hover {
+  color: #5a0000;
+}
+
 .status-bar {
   padding: 4px 12px;
   border-top: 1px solid #d1d1d6;
@@ -197,5 +295,47 @@ body {
   .panel-empty,
   .status-text {
     color: #8e8e93;
+  }
+  .root-item {
+    border-color: #2c2c2e;
+  }
+  .root-path {
+    color: #f2f2f7;
+  }
+  .root-kind {
+    background: #1c2a44;
+    color: #9bc0ff;
+    border-color: #2c3e64;
+  }
+  .root-kind.kind-nas {
+    background: #2a1f44;
+    color: #c8a8ff;
+    border-color: #3e2f64;
+  }
+  .root-status.status-available {
+    background: #1f3322;
+    color: #8fdc99;
+    border-color: #2c4530;
+  }
+  .root-status.status-disconnected {
+    background: #3a2c12;
+    color: #f0c878;
+    border-color: #4a3a1c;
+  }
+  .root-status.status-scanning {
+    background: #1c2a44;
+    color: #9bc0ff;
+    border-color: #2c3e64;
+  }
+  .root-status.status-error {
+    background: #3a1f1f;
+    color: #ff9b9b;
+    border-color: #4a2c2c;
+  }
+  .status-error {
+    color: #ff9b9b;
+  }
+  .status-dismiss:hover {
+    color: #ffd0d0;
   }
 }
