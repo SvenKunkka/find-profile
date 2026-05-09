@@ -5,9 +5,14 @@ use std::sync::MutexGuard;
 use rusqlite::Connection;
 use tauri::State;
 
+use serde::Serialize;
+use tauri::AppHandle;
+use tauri::Manager;
+
 use crate::db::{self, FileHit, Root, RootKind, RootStatus, ScanJob, SearchOptions, SortBy};
 use crate::roots::register_root;
-use crate::scanner::{self, ScanInput};
+use crate::scanner::{self, ScanFilters, ScanInput};
+use crate::settings::{self, Settings};
 use std::sync::Arc;
 
 use super::error::{CommandError, CommandResult};
@@ -69,13 +74,22 @@ pub fn rescan_root(state: State<'_, AppState>, root_id: i64) -> CommandResult<()
 }
 
 fn spawn_scan(state: &AppState, root_id: i64) -> CommandResult<()> {
-    // Validate the root exists and capture its path/kind synchronously so we
-    // can return a useful error to the caller without entering the worker.
-    let (root_path, source_kind) = {
+    // Validate the root exists, capture its path/kind, and snapshot the
+    // user's current scan filters synchronously so we can return a clean
+    // error to the caller without entering the worker.
+    let (root_path, source_kind, filters) = {
         let conn = lock_conn(state)?;
         let root = db::get_root(&conn, root_id)?;
-        (root.path, root.kind)
+        let s = settings::load(&conn).unwrap_or_default();
+        let filters = ScanFilters {
+            include_files: s.index_files,
+            include_folders: s.index_folders,
+            show_hidden: s.show_hidden_files,
+        };
+        (root.path, root.kind, filters)
     };
+
+    tracing::info!(root_id, root_path = %root_path, ?filters, "spawn_scan");
 
     // Register a fresh cancellation token for this scan. `cancel_scan` flips
     // it; the worker polls it at every walker iteration.
@@ -91,6 +105,7 @@ fn spawn_scan(state: &AppState, root_id: i64) -> CommandResult<()> {
                 root_path,
                 source_kind,
             },
+            filters,
             cancel,
             |_progress| {
                 // TODO(next stage): emit `scan-progress` Tauri events. For
@@ -100,7 +115,7 @@ fn spawn_scan(state: &AppState, root_id: i64) -> CommandResult<()> {
         // Always clear the token so a follow-up Scan can register a fresh one.
         cancellations.clear(root_id);
         if let Err(e) = result {
-            eprintln!("scan worker for root {root_id} failed: {e}");
+            tracing::error!(root_id, error = %e, "scan worker failed");
         }
     });
 
@@ -192,7 +207,15 @@ pub fn search_files(
     };
 
     let conn = lock_conn(&state)?;
-    Ok(db::search_files_with_options(&conn, &options)?)
+    let hits = db::search_files_with_options(&conn, &options)?;
+    tracing::info!(
+        query = %options.query,
+        count = hits.len(),
+        sort = ?options.sort,
+        source = ?options.source,
+        "search_files",
+    );
+    Ok(hits)
 }
 
 #[tauri::command]
@@ -287,13 +310,125 @@ pub fn remove_index_root(
     // Stop the watcher *before* mutating the DB so a stale event from notify
     // can't race with a removed/disabled root row.
     if let Err(e) = state.watchers.stop(root_id) {
-        eprintln!("watcher: failed to stop watcher for root {root_id}: {e}");
+        tracing::warn!(root_id, error = %e, "failed to stop watcher");
     }
     let conn = lock_conn(&state)?;
     if keep_index {
         db::disable_root(&conn, root_id)?;
+        tracing::info!(root_id, "root disabled (index kept)");
     } else {
         db::delete_root(&conn, root_id)?;
+        tracing::info!(root_id, "root deleted (cascade)");
+    }
+    Ok(())
+}
+
+// ---- settings & maintenance commands ---------------------------------------
+
+#[tauri::command]
+pub fn get_settings(state: State<'_, AppState>) -> CommandResult<Settings> {
+    let conn = lock_conn(&state)?;
+    Ok(settings::load(&conn)?)
+}
+
+#[tauri::command]
+pub fn update_settings(
+    state: State<'_, AppState>,
+    settings: Settings,
+) -> CommandResult<Settings> {
+    let sanitized = settings.sanitized();
+    {
+        let conn = lock_conn(&state)?;
+        crate::settings::save(&conn, &sanitized)?;
+    }
+    tracing::info!(?sanitized, "settings updated");
+    Ok(sanitized)
+}
+
+#[derive(Debug, Serialize)]
+pub struct AppPaths {
+    pub db_path: String,
+    pub log_dir: String,
+}
+
+#[tauri::command]
+pub fn get_app_paths(app: AppHandle) -> CommandResult<AppPaths> {
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| CommandError::new("path", e.to_string()))?;
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|e| CommandError::new("path", e.to_string()))?;
+    Ok(AppPaths {
+        db_path: app_data
+            .join("find_profile.db")
+            .to_string_lossy()
+            .into_owned(),
+        log_dir: log_dir.to_string_lossy().into_owned(),
+    })
+}
+
+#[tauri::command]
+pub fn clear_index(state: State<'_, AppState>) -> CommandResult<()> {
+    let conn = lock_conn(&state)?;
+    let n = conn
+        .execute("DELETE FROM files", [])
+        .map_err(|e| CommandError::from(crate::db::DbError::Sqlite(e)))?;
+    tracing::warn!(removed = n, "clear_index: all file rows deleted");
+    Ok(())
+}
+
+#[tauri::command]
+pub fn rebuild_index(state: State<'_, AppState>) -> CommandResult<()> {
+    {
+        let conn = lock_conn(&state)?;
+        let n = conn
+            .execute("DELETE FROM files", [])
+            .map_err(|e| CommandError::from(crate::db::DbError::Sqlite(e)))?;
+        tracing::warn!(removed = n, "rebuild_index: cleared file rows");
+    }
+    let roots = {
+        let conn = lock_conn(&state)?;
+        db::list_roots(&conn)?
+    };
+    let mut spawned = 0;
+    for r in roots.iter().filter(|r| r.enabled) {
+        if let Err(e) = spawn_scan(&state, r.id) {
+            tracing::warn!(root_id = r.id, error = %e, "rebuild_index: failed to spawn scan");
+        } else {
+            spawned += 1;
+        }
+    }
+    tracing::info!(spawned, "rebuild_index: scans spawned");
+    Ok(())
+}
+
+#[tauri::command]
+pub fn open_log_dir(app: AppHandle) -> CommandResult<()> {
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|e| CommandError::new("path", e.to_string()))?;
+    if !log_dir.exists() {
+        std::fs::create_dir_all(&log_dir).map_err(CommandError::from)?;
+    }
+    if !cfg!(target_os = "macos") {
+        return Err(CommandError::new(
+            "unsupported",
+            "open_log_dir is implemented only for macOS in MVP",
+        ));
+    }
+    let status = Command::new("open")
+        .arg(&log_dir)
+        .status()
+        .map_err(CommandError::from)?;
+    if !status.success() {
+        return Err(CommandError::new(
+            "io",
+            format!("`open` exited with status {:?}", status.code()),
+        ));
     }
     Ok(())
 }

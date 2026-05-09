@@ -185,6 +185,190 @@ body {
   border-color: #a31515;
 }
 
+.btn-settings,
+.btn-secondary {
+  font: inherit;
+  font-size: 11px;
+  padding: 3px 10px;
+  border: 1px solid #c7c7cc;
+  border-radius: 4px;
+  background: #ffffff;
+  color: #1c1c1e;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.btn-settings:hover,
+.btn-secondary:hover {
+  border-color: #0a84ff;
+  background: #f0f0f3;
+}
+
+.btn-danger {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 12px;
+  border: 1px solid #d97a7a;
+  border-radius: 4px;
+  background: #fdf3f3;
+  color: #a31515;
+  cursor: pointer;
+  font-weight: 500;
+}
+
+.btn-danger:hover {
+  background: #fbeaea;
+  border-color: #a31515;
+}
+
+/* ---------- modal ---------- */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal {
+  background: #ffffff;
+  border-radius: 8px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.25);
+  width: min(560px, 90vw);
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid #e5e5ea;
+  background: #f9f9fb;
+}
+
+.modal-header h2 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.modal-close {
+  font: inherit;
+  font-size: 20px;
+  line-height: 1;
+  border: none;
+  background: transparent;
+  color: #3a3a3c;
+  cursor: pointer;
+  padding: 0 4px;
+}
+
+.modal-close:hover {
+  color: #1c1c1e;
+}
+
+.modal-body {
+  padding: 12px 16px 16px 16px;
+  overflow-y: auto;
+}
+
+.modal-loading {
+  margin: 0;
+  color: #8e8e93;
+  font-size: 12px;
+  padding: 8px 0;
+}
+
+.settings-section {
+  border-top: 1px solid #f0f0f3;
+  padding: 10px 0;
+}
+
+.settings-section:first-child {
+  border-top: none;
+  padding-top: 0;
+}
+
+.settings-section h3 {
+  margin: 0 0 8px 0;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #6e6e73;
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 12px;
+  color: #1c1c1e;
+}
+
+.settings-row > span {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.settings-row input[type="number"] {
+  font: inherit;
+  font-size: 12px;
+  padding: 2px 6px;
+  border: 1px solid #c7c7cc;
+  border-radius: 3px;
+  background: #ffffff;
+  color: #1c1c1e;
+  width: 100px;
+}
+
+.settings-row input[type="checkbox"] {
+  margin: 0;
+}
+
+.settings-row-disabled {
+  color: #8e8e93;
+}
+
+.settings-hint {
+  font-style: normal;
+  color: #8e8e93;
+  font-size: 11px;
+}
+
+.settings-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  background: #f5f5f7;
+  padding: 2px 6px;
+  border-radius: 3px;
+  direction: rtl;
+  text-align: left;
+}
+
+.settings-section-danger h3 {
+  color: #a31515;
+}
+
+.settings-danger-note {
+  margin: 0 0 8px 0;
+  font-size: 11px;
+  color: #6e6e73;
+  line-height: 1.5;
+}
+
 /* ---------- roots list ---------- */
 
 .roots-list {
@@ -690,6 +874,66 @@ body {
   .btn-scan-cancel:hover {
     background: #3a1f1f;
     border-color: #ff9b9b;
+  }
+  .btn-settings,
+  .btn-secondary {
+    background: #2c2c2e;
+    color: #f2f2f7;
+    border-color: #3a3a3c;
+  }
+  .btn-settings:hover,
+  .btn-secondary:hover {
+    background: #3a3a3c;
+    border-color: #0a84ff;
+  }
+  .btn-danger {
+    background: #3a1f1f;
+    color: #ff9b9b;
+    border-color: #6a2c2c;
+  }
+  .btn-danger:hover {
+    background: #4a2c2c;
+    border-color: #ff9b9b;
+  }
+  .modal {
+    background: #1c1c1e;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+  }
+  .modal-header {
+    background: #2c2c2e;
+    border-color: #3a3a3c;
+  }
+  .modal-close {
+    color: #d1d1d6;
+  }
+  .modal-close:hover {
+    color: #f2f2f7;
+  }
+  .modal-loading,
+  .settings-hint,
+  .settings-danger-note {
+    color: #8e8e93;
+  }
+  .settings-section {
+    border-color: #2c2c2e;
+  }
+  .settings-section h3 {
+    color: #8e8e93;
+  }
+  .settings-section-danger h3 {
+    color: #ff9b9b;
+  }
+  .settings-row {
+    color: #f2f2f7;
+  }
+  .settings-row input[type="number"] {
+    background: #2c2c2e;
+    color: #f2f2f7;
+    border-color: #3a3a3c;
+  }
+  .settings-path {
+    background: #2c2c2e;
+    color: #d1d1d6;
   }
   .roots-hints {
     background: #2c2c2e;

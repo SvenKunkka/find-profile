@@ -6,6 +6,8 @@ pub mod scan_jobs;
 mod schema;
 mod util;
 
+pub(crate) use util::now_iso;
+
 use std::path::Path;
 
 use rusqlite::Connection;

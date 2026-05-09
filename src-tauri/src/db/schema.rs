@@ -66,6 +66,12 @@ CREATE TABLE IF NOT EXISTS scan_jobs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_scan_jobs_root_id ON scan_jobs(root_id);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 "#;
 
 pub fn apply(conn: &Connection) -> Result<()> {

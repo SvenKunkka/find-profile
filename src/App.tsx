@@ -46,6 +46,21 @@ interface ScanJob {
   error_message: string | null;
 }
 
+interface Settings {
+  search_default_limit: number;
+  restore_watchers_on_startup: boolean;
+  nas_scan_interval_minutes: number | null;
+  show_hidden_files: boolean;
+  index_files: boolean;
+  index_folders: boolean;
+  keep_disconnected_nas_index: boolean;
+}
+
+interface AppPaths {
+  db_path: string;
+  log_dir: string;
+}
+
 interface CommandError {
   code: string;
   message: string;
@@ -144,6 +159,12 @@ function App() {
   const [page, setPage] = useState(0);
 
   const searchTimer = useRef<number | null>(null);
+
+  // Settings modal.
+  const [showSettings, setShowSettings] = useState(false);
+  const [settings, setSettings] = useState<Settings | null>(null);
+  const [appPaths, setAppPaths] = useState<AppPaths | null>(null);
+  const [settingsBusy, setSettingsBusy] = useState(false);
 
   const extensions = useMemo(
     () => parseExtensionInput(extensionInput),
@@ -301,6 +322,101 @@ function App() {
     }
   }
 
+  async function openSettings() {
+    setShowSettings(true);
+    if (settings === null || appPaths === null) {
+      try {
+        const [s, p] = await Promise.all([
+          invoke<Settings>("get_settings"),
+          invoke<AppPaths>("get_app_paths"),
+        ]);
+        setSettings(s);
+        setAppPaths(p);
+      } catch (e) {
+        console.error("settings load failed", e);
+        setError(`Failed to load settings: ${formatError(e)}`);
+      }
+    }
+  }
+
+  async function patchSettings(patch: Partial<Settings>) {
+    if (!settings) return;
+    const next = { ...settings, ...patch };
+    setSettings(next);
+    setSettingsBusy(true);
+    try {
+      const saved = await invoke<Settings>("update_settings", {
+        settings: next,
+      });
+      setSettings(saved);
+    } catch (e) {
+      console.error("update_settings failed", e);
+      setError(`Failed to save settings: ${formatError(e)}`);
+    } finally {
+      setSettingsBusy(false);
+    }
+  }
+
+  async function handleClearIndex() {
+    if (
+      !window.confirm(
+        "Clear the entire file index?\n\nRoots and settings are kept, but every cached file row is removed. Search will return nothing until you rescan."
+      )
+    ) {
+      return;
+    }
+    if (
+      !window.confirm(
+        "Are you absolutely sure? This action cannot be undone."
+      )
+    ) {
+      return;
+    }
+    try {
+      await invoke("clear_index");
+      setError(null);
+      setResults([]);
+    } catch (e) {
+      console.error("clear_index failed", e);
+      setError(`Failed to clear index: ${formatError(e)}`);
+    }
+  }
+
+  async function handleRebuildIndex() {
+    if (
+      !window.confirm(
+        "Rebuild every enabled root?\n\nThe current index is wiped first, then a scan is started for each root. Existing search results disappear immediately and reappear as scans complete."
+      )
+    ) {
+      return;
+    }
+    if (
+      !window.confirm(
+        "Confirm: clear current index and rescan every enabled root?"
+      )
+    ) {
+      return;
+    }
+    try {
+      await invoke("rebuild_index");
+      setError(null);
+      setResults([]);
+      await refreshRoots();
+    } catch (e) {
+      console.error("rebuild_index failed", e);
+      setError(`Failed to rebuild index: ${formatError(e)}`);
+    }
+  }
+
+  async function handleOpenLogDir() {
+    try {
+      await invoke("open_log_dir");
+    } catch (e) {
+      console.error("open_log_dir failed", e);
+      setError(`Failed to open log directory: ${formatError(e)}`);
+    }
+  }
+
   async function handleReveal(path: string) {
     setError(null);
     try {
@@ -338,6 +454,14 @@ function App() {
         <div className="result-count" aria-live="polite">
           {resultCountLabel}
         </div>
+        <button
+          type="button"
+          className="btn-settings"
+          onClick={() => void openSettings()}
+          aria-label="Open settings"
+        >
+          Settings
+        </button>
       </header>
 
       <main className="app-body">
@@ -634,6 +758,206 @@ function App() {
           )}
         </div>
       </footer>
+
+      {showSettings && (
+        <div
+          className="modal-overlay"
+          onClick={() => setShowSettings(false)}
+          role="presentation"
+        >
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Settings"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <header className="modal-header">
+              <h2>Settings</h2>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={() => setShowSettings(false)}
+                aria-label="Close settings"
+              >
+                ×
+              </button>
+            </header>
+            <div className="modal-body">
+              {!settings ? (
+                <p className="modal-loading">Loading…</p>
+              ) : (
+                <>
+                  <section className="settings-section">
+                    <h3>Search</h3>
+                    <label className="settings-row">
+                      <span>Default page size</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={1000}
+                        value={settings.search_default_limit}
+                        onChange={(e) =>
+                          void patchSettings({
+                            search_default_limit:
+                              Number(e.target.value) || 1,
+                          })
+                        }
+                      />
+                    </label>
+                  </section>
+
+                  <section className="settings-section">
+                    <h3>Indexing</h3>
+                    <label className="settings-row">
+                      <input
+                        type="checkbox"
+                        checked={settings.index_files}
+                        onChange={(e) =>
+                          void patchSettings({ index_files: e.target.checked })
+                        }
+                      />
+                      <span>Index files</span>
+                    </label>
+                    <label className="settings-row">
+                      <input
+                        type="checkbox"
+                        checked={settings.index_folders}
+                        onChange={(e) =>
+                          void patchSettings({
+                            index_folders: e.target.checked,
+                          })
+                        }
+                      />
+                      <span>Index folders</span>
+                    </label>
+                    <label className="settings-row">
+                      <input
+                        type="checkbox"
+                        checked={settings.show_hidden_files}
+                        onChange={(e) =>
+                          void patchSettings({
+                            show_hidden_files: e.target.checked,
+                          })
+                        }
+                      />
+                      <span>
+                        Show hidden files
+                        <em className="settings-hint">
+                          {" "}
+                          (basenames starting with <code>.</code>)
+                        </em>
+                      </span>
+                    </label>
+                  </section>
+
+                  <section className="settings-section">
+                    <h3>Watchers & NAS</h3>
+                    <label className="settings-row">
+                      <input
+                        type="checkbox"
+                        checked={settings.restore_watchers_on_startup}
+                        onChange={(e) =>
+                          void patchSettings({
+                            restore_watchers_on_startup: e.target.checked,
+                          })
+                        }
+                      />
+                      <span>Restore local-root watchers at startup</span>
+                    </label>
+                    <label className="settings-row">
+                      <span>NAS scan interval (minutes)</span>
+                      <input
+                        type="number"
+                        min={0}
+                        placeholder="off"
+                        value={settings.nas_scan_interval_minutes ?? ""}
+                        onChange={(e) => {
+                          const raw = e.target.value;
+                          const v = raw.length === 0 ? null : Number(raw);
+                          void patchSettings({
+                            nas_scan_interval_minutes:
+                              v === null || Number.isNaN(v) || v < 0 ? null : v,
+                          });
+                        }}
+                      />
+                    </label>
+                    <label className="settings-row settings-row-disabled">
+                      <input
+                        type="checkbox"
+                        checked={settings.keep_disconnected_nas_index}
+                        disabled
+                        readOnly
+                      />
+                      <span>
+                        Keep index when NAS disconnects
+                        <em className="settings-hint">
+                          {" "}
+                          (always on — see docs/architecture.md)
+                        </em>
+                      </span>
+                    </label>
+                  </section>
+
+                  <section className="settings-section">
+                    <h3>Storage</h3>
+                    <div className="settings-row">
+                      <span>Database</span>
+                      <code className="settings-path" title={appPaths?.db_path}>
+                        {appPaths?.db_path ?? "—"}
+                      </code>
+                    </div>
+                    <div className="settings-row">
+                      <span>Logs</span>
+                      <code
+                        className="settings-path"
+                        title={appPaths?.log_dir}
+                      >
+                        {appPaths?.log_dir ?? "—"}
+                      </code>
+                      <button
+                        type="button"
+                        className="btn-secondary"
+                        onClick={() => void handleOpenLogDir()}
+                      >
+                        Open
+                      </button>
+                    </div>
+                  </section>
+
+                  <section className="settings-section settings-section-danger">
+                    <h3>Danger zone</h3>
+                    <p className="settings-danger-note">
+                      These actions affect every root and cannot be undone.
+                      Each click asks for two confirmations.
+                    </p>
+                    <div className="settings-row">
+                      <button
+                        type="button"
+                        className="btn-danger"
+                        onClick={() => void handleClearIndex()}
+                      >
+                        Clear index
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-danger"
+                        onClick={() => void handleRebuildIndex()}
+                      >
+                        Rebuild all indexes
+                      </button>
+                    </div>
+                  </section>
+
+                  {settingsBusy && (
+                    <p className="modal-loading">Saving…</p>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

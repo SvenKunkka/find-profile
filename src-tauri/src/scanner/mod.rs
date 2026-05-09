@@ -38,6 +38,30 @@ pub struct ScanInput {
     pub source_kind: RootKind,
 }
 
+/// Per-scan inclusion filters, derived from app settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanFilters {
+    pub include_files: bool,
+    pub include_folders: bool,
+    pub show_hidden: bool,
+}
+
+impl Default for ScanFilters {
+    fn default() -> Self {
+        Self {
+            include_files: true,
+            include_folders: true,
+            show_hidden: false,
+        }
+    }
+}
+
+fn is_hidden_basename(name: &str) -> bool {
+    // Treat any dot-prefixed filename as hidden on every platform; this is
+    // the convention macOS/Linux respect and what Finder hides by default.
+    matches!(name.chars().next(), Some('.'))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Progress {
     pub job_id: i64,
@@ -63,7 +87,13 @@ pub fn scan(
     input: ScanInput,
     on_progress: impl FnMut(&Progress),
 ) -> Result<ScanOutcome> {
-    scan_cancellable(conn, input, Arc::new(AtomicBool::new(false)), on_progress)
+    scan_cancellable(
+        conn,
+        input,
+        ScanFilters::default(),
+        Arc::new(AtomicBool::new(false)),
+        on_progress,
+    )
 }
 
 /// Run a full scan with cooperative cancellation.
@@ -86,9 +116,17 @@ pub fn scan(
 pub fn scan_cancellable(
     conn: Arc<Mutex<Connection>>,
     input: ScanInput,
+    filters: ScanFilters,
     cancel: Arc<AtomicBool>,
     mut on_progress: impl FnMut(&Progress),
 ) -> Result<ScanOutcome> {
+    tracing::info!(
+        root_id = input.root_id,
+        root_path = %input.root_path,
+        kind = ?input.source_kind,
+        filters = ?filters,
+        "scan starting",
+    );
     let job_id = {
         let g = lock(&conn)?;
         db::create_scan_job(&g, input.root_id)?
@@ -97,6 +135,7 @@ pub fn scan_cancellable(
     if !probe_path_accessibility(&input.root_path) {
         let new_status = decide_status_from_accessibility(input.source_kind, false);
         let msg = format!("root path not accessible: {}", input.root_path);
+        tracing::warn!(root_id = input.root_id, ?new_status, "{}", msg);
         let g = lock(&conn)?;
         db::finish_scan_job(&g, job_id, ScanJobStatus::Failed, Some(&msg))?;
         db::update_root_status(&g, input.root_id, new_status)?;
@@ -138,8 +177,25 @@ pub fn scan_cancellable(
         match entry_result {
             Ok(entry) => {
                 current_path = Some(entry.path().to_string_lossy().into_owned());
+
+                // Cheap basename filter before stat() — if the entry is hidden
+                // and the user disabled hidden files, drop it without paying
+                // the metadata read cost.
+                if !filters.show_hidden {
+                    let name = entry.file_name().to_string_lossy();
+                    if is_hidden_basename(&name) {
+                        continue;
+                    }
+                }
+
                 match extract_metadata(&entry, input.root_id, input.source_kind) {
                     Some(m) => {
+                        if m.is_dir && !filters.include_folders {
+                            continue;
+                        }
+                        if !m.is_dir && !filters.include_files {
+                            continue;
+                        }
                         buffer.push(m);
                         scanned += 1;
                     }
@@ -197,6 +253,7 @@ pub fn scan_cancellable(
             if scanned == 1 { "y" } else { "ies" },
             if errors == 1 { "" } else { "s" },
         );
+        tracing::info!(root_id = input.root_id, scanned, errors, "scan cancelled");
         db::finish_scan_job(&g, job_id, ScanJobStatus::Cancelled, Some(&msg))?;
         db::update_root_status(&g, input.root_id, RootStatus::Available)?;
         return Ok(ScanOutcome {
@@ -216,6 +273,12 @@ pub fn scan_cancellable(
     } else {
         None
     };
+    tracing::info!(
+        root_id = input.root_id,
+        scanned,
+        errors,
+        "scan finished",
+    );
     db::finish_scan_job(&g, job_id, ScanJobStatus::Success, final_msg.as_deref())?;
     db::update_root_status(&g, input.root_id, RootStatus::Available)?;
 
@@ -257,7 +320,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::db::{init_in_memory_db, search_files, upsert_file};
+    use crate::db::{init_in_memory_db, search_files, upsert_file, Root};
     use crate::roots::register_root;
 
     fn unique_test_dir(label: &str) -> PathBuf {
@@ -610,6 +673,7 @@ mod tests {
                 root_path: root.path.clone(),
                 source_kind: root.kind,
             },
+            ScanFilters::default(),
             cancel,
             |_| {},
         )
@@ -664,7 +728,14 @@ mod tests {
         // First run: pre-cancelled → no writes, status=Cancelled, root back
         // to Available so a follow-up scan can run.
         let cancel = Arc::new(AtomicBool::new(true));
-        let first = scan_cancellable(conn.clone(), input.clone(), cancel, |_| {}).unwrap();
+        let first = scan_cancellable(
+            conn.clone(),
+            input.clone(),
+            ScanFilters::default(),
+            cancel,
+            |_| {},
+        )
+        .unwrap();
         assert_eq!(first.status, ScanJobStatus::Cancelled);
         assert_eq!(first.final_root_status, RootStatus::Available);
 
@@ -673,6 +744,144 @@ mod tests {
         assert_eq!(second.status, ScanJobStatus::Success);
         assert!(second.scanned_count >= 5);
 
+        cleanup(&dir);
+    }
+
+    // --- filter tests ---------------------------------------------------
+
+    fn run_with_filters(
+        conn: Arc<Mutex<Connection>>,
+        root: &Root,
+        filters: ScanFilters,
+    ) -> ScanOutcome {
+        scan_cancellable(
+            conn,
+            ScanInput {
+                root_id: root.id,
+                root_path: root.path.clone(),
+                source_kind: root.kind,
+            },
+            filters,
+            Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn filter_default_indexes_visible_files_and_dirs() {
+        let dir = unique_test_dir("filter_default");
+        fs::write(dir.join("visible.txt"), b"v").unwrap();
+        fs::create_dir_all(dir.join("subdir")).unwrap();
+        fs::write(dir.join(".hidden_file"), b"h").unwrap();
+
+        let conn = make_conn();
+        let root = {
+            let g = conn.lock().unwrap();
+            register_root(&g, dir.to_str().unwrap(), Some("local")).unwrap()
+        };
+        let outcome = run_with_filters(conn.clone(), &root, ScanFilters::default());
+        // visible.txt + subdir = 2 (hidden file dropped)
+        assert_eq!(outcome.scanned_count, 2);
+
+        let g = conn.lock().unwrap();
+        assert!(search_files(&g, "visible", 10, 0)
+            .unwrap()
+            .iter()
+            .any(|h| h.name == "visible.txt"));
+        assert!(search_files(&g, "subdir", 10, 0)
+            .unwrap()
+            .iter()
+            .any(|h| h.is_dir));
+        assert!(search_files(&g, "hidden", 10, 0).unwrap().is_empty());
+
+        drop(g);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn filter_show_hidden_includes_dotfiles() {
+        let dir = unique_test_dir("filter_show_hidden");
+        fs::write(dir.join(".hidden_file"), b"h").unwrap();
+        fs::write(dir.join("plain.txt"), b"p").unwrap();
+
+        let conn = make_conn();
+        let root = {
+            let g = conn.lock().unwrap();
+            register_root(&g, dir.to_str().unwrap(), Some("local")).unwrap()
+        };
+        let outcome = run_with_filters(
+            conn.clone(),
+            &root,
+            ScanFilters {
+                show_hidden: true,
+                ..ScanFilters::default()
+            },
+        );
+        assert_eq!(outcome.scanned_count, 2);
+        let g = conn.lock().unwrap();
+        assert!(!search_files(&g, "hidden", 10, 0).unwrap().is_empty());
+        drop(g);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn filter_excludes_files() {
+        let dir = unique_test_dir("filter_no_files");
+        fs::write(dir.join("a.txt"), b"a").unwrap();
+        fs::create_dir_all(dir.join("only_dir")).unwrap();
+
+        let conn = make_conn();
+        let root = {
+            let g = conn.lock().unwrap();
+            register_root(&g, dir.to_str().unwrap(), Some("local")).unwrap()
+        };
+        let outcome = run_with_filters(
+            conn.clone(),
+            &root,
+            ScanFilters {
+                include_files: false,
+                ..ScanFilters::default()
+            },
+        );
+        assert_eq!(outcome.scanned_count, 1, "only the directory should be indexed");
+        let g = conn.lock().unwrap();
+        let hits = search_files(&g, "txt", 10, 0).unwrap();
+        assert!(hits.iter().all(|h| h.is_dir));
+        drop(g);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn filter_excludes_folders() {
+        let dir = unique_test_dir("filter_no_folders");
+        fs::write(dir.join("a.txt"), b"a").unwrap();
+        fs::create_dir_all(dir.join("only_dir")).unwrap();
+        fs::write(dir.join("only_dir").join("nested.txt"), b"n").unwrap();
+
+        let conn = make_conn();
+        let root = {
+            let g = conn.lock().unwrap();
+            register_root(&g, dir.to_str().unwrap(), Some("local")).unwrap()
+        };
+        let outcome = run_with_filters(
+            conn.clone(),
+            &root,
+            ScanFilters {
+                include_folders: false,
+                ..ScanFilters::default()
+            },
+        );
+        // a.txt + nested.txt — directory itself is excluded, but walker still
+        // recurses into it so its children are indexed.
+        assert_eq!(outcome.scanned_count, 2);
+        let g = conn.lock().unwrap();
+        let dirs: Vec<_> = search_files(&g, "only", 10, 0).unwrap();
+        assert!(
+            dirs.iter().all(|h| !h.is_dir),
+            "no directory entries should be indexed"
+        );
+        drop(g);
         cleanup(&dir);
     }
 
@@ -695,7 +904,14 @@ mod tests {
         };
 
         let cancel = Arc::new(AtomicBool::new(true));
-        scan_cancellable(conn.clone(), input.clone(), cancel, |_| {}).unwrap();
+        scan_cancellable(
+            conn.clone(),
+            input.clone(),
+            ScanFilters::default(),
+            cancel,
+            |_| {},
+        )
+        .unwrap();
 
         let g = conn.lock().unwrap();
         let status: String = g
