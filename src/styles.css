@@ -269,6 +269,24 @@ body {
   border-color: #f1c4c4;
 }
 
+.roots-hints {
+  flex: 0 0 auto;
+  padding: 8px 12px;
+  border-top: 1px solid #e5e5ea;
+  background: #f9f9fb;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #6e6e73;
+}
+
+.roots-hints p {
+  margin: 0;
+}
+
+.roots-hints p + p {
+  margin-top: 4px;
+}
+
 /* ---------- results table ---------- */
 
 .results-table-wrap {
@@ -349,6 +367,15 @@ body {
 
 .cell-name {
   font-weight: 500;
+}
+
+.cell-access-unavailable {
+  color: #8a5a00;
+  font-style: italic;
+}
+
+.cell-access-no {
+  color: #a31515;
 }
 
 .result-row {
@@ -487,8 +514,19 @@ body {
   }
   .panel-empty,
   .result-count,
-  .status-label {
+  .status-label,
+  .roots-hints {
     color: #8e8e93;
+  }
+  .roots-hints {
+    background: #2c2c2e;
+    border-color: #3a3a3c;
+  }
+  .cell-access-unavailable {
+    color: #f0c878;
+  }
+  .cell-access-no {
+    color: #ff9b9b;
   }
   .root-item {
     border-color: #2c2c2e;

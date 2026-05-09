@@ -29,6 +29,7 @@ interface FileHit {
   source_kind: RootKind;
   is_accessible: boolean;
   indexed_at: string;
+  root_status: RootStatus;
 }
 
 interface ScanJob {
@@ -81,6 +82,26 @@ function formatSize(bytes: number | null, isDir: boolean): string {
     i += 1;
   }
   return `${v.toFixed(v < 10 ? 1 : 0)} ${units[i]}`;
+}
+
+function accessibilityLabel(hit: FileHit): string {
+  // A NAS root that's disconnected (or any root in error state) makes its
+  // cached files unreachable right now even if `is_accessible` was true at
+  // scan time. Surface that as `unavailable` so users don't think a stale
+  // entry is openable.
+  if (hit.root_status === "disconnected" || hit.root_status === "error") {
+    return "unavailable";
+  }
+  return hit.is_accessible ? "yes" : "no";
+}
+
+function accessibilityClass(hit: FileHit): string {
+  if (hit.root_status === "disconnected" || hit.root_status === "error") {
+    return "cell-access cell-access-unavailable";
+  }
+  return hit.is_accessible
+    ? "cell-access cell-access-yes"
+    : "cell-access cell-access-no";
 }
 
 function formatModified(iso: string | null): string {
@@ -321,6 +342,10 @@ function App() {
               ))}
             </ul>
           )}
+          <div className="roots-hints" role="note" aria-label="NAS notes">
+            <p>NAS scanning speed depends on network and NAS performance.</p>
+            <p>Disconnected NAS roots keep their old index.</p>
+          </div>
         </aside>
 
         <section className="results-panel" aria-label="Results">
@@ -382,7 +407,9 @@ function App() {
                           {hit.source_kind}
                         </span>
                       </td>
-                      <td>{hit.is_accessible ? "yes" : "no"}</td>
+                      <td className={accessibilityClass(hit)}>
+                        {accessibilityLabel(hit)}
+                      </td>
                       <td className="cell-actions">
                         <button
                           type="button"

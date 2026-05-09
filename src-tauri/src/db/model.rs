@@ -181,6 +181,10 @@ pub struct FileHit {
     pub source_kind: RootKind,
     pub is_accessible: bool,
     pub indexed_at: String,
+    /// Live status of the root that owns this hit. The frontend uses this to
+    /// render Accessible as `unavailable` when the root is disconnected, even
+    /// if the file's own `is_accessible` was true at scan time.
+    pub root_status: RootStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

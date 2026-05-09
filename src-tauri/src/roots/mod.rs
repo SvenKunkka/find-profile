@@ -6,7 +6,9 @@ use rusqlite::Connection;
 
 use crate::db::{self, Root, RootStatus};
 
-pub use availability::{decide_status_from_accessibility, probe_path_accessibility};
+pub use availability::{
+    decide_status_from_accessibility, probe_path_accessibility, should_watch_root,
+};
 pub use error::{Result, RootError};
 pub use kind::{parse_kind, resolve_kind};
 

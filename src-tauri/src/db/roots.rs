@@ -63,6 +63,25 @@ pub fn list_roots(conn: &Connection) -> Result<Vec<Root>> {
     Ok(out)
 }
 
+/// Find the most-specific root whose path contains the given filesystem path,
+/// or `None` if no registered root owns it.
+///
+/// Used by `commands::open_file` / `reveal_in_finder` to detect that a target
+/// path lives under a NAS root that is currently disconnected, so the UI can
+/// surface a clear "NAS unavailable" error instead of the generic not-found.
+pub fn find_root_for_path(conn: &Connection, path: &str) -> Result<Option<Root>> {
+    let sql = format!(
+        "SELECT {SELECT_COLS} FROM roots
+         WHERE ?1 = path OR ?1 LIKE path || '/%'
+         ORDER BY length(path) DESC
+         LIMIT 1"
+    );
+    let root = conn
+        .query_row(&sql, params![path], map_row)
+        .optional()?;
+    Ok(root)
+}
+
 /// Soft-remove a root by flipping its `enabled` flag to 0.
 /// The `files` and `scan_jobs` rows for this root are preserved untouched —
 /// the index remains queryable even though the root is no longer active.

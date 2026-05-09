@@ -17,7 +17,10 @@ pub use files::{
 pub use model::{
     EnumParseError, FileHit, FileMetadata, Root, RootKind, RootStatus, ScanJob, ScanJobStatus,
 };
-pub use roots::{add_root, delete_root, disable_root, get_root, list_roots, update_root_status};
+pub use roots::{
+    add_root, delete_root, disable_root, find_root_for_path, get_root, list_roots,
+    update_root_status,
+};
 pub use scan_jobs::{
     create_scan_job, finish_scan_job, get_latest_scan_job_for_root, get_scan_job,
     update_scan_job_progress,
@@ -437,6 +440,85 @@ mod tests {
         let latest = get_latest_scan_job_for_root(&conn, r.id).unwrap().unwrap();
         assert_eq!(latest.id, j2);
         assert_eq!(latest.status, ScanJobStatus::Running);
+    }
+
+    #[test]
+    fn search_files_returns_current_root_status() {
+        let conn = init_in_memory_db().unwrap();
+        let r = add_root(&conn, "/Volumes/Backup", RootKind::Nas).unwrap();
+        upsert_file(
+            &conn,
+            &meta(r.id, "/Volumes/Backup/file.txt", "file.txt"),
+        )
+        .unwrap();
+
+        let hits_avail = search_files(&conn, "file", 10, 0).unwrap();
+        assert_eq!(hits_avail.len(), 1);
+        assert_eq!(hits_avail[0].root_status, RootStatus::Available);
+
+        update_root_status(&conn, r.id, RootStatus::Disconnected).unwrap();
+        let hits_disc = search_files(&conn, "file", 10, 0).unwrap();
+        assert_eq!(hits_disc.len(), 1, "old index must remain searchable");
+        assert_eq!(
+            hits_disc[0].root_status,
+            RootStatus::Disconnected,
+            "FileHit must carry the live root status"
+        );
+    }
+
+    #[test]
+    fn find_root_for_path_returns_owning_root() {
+        let conn = init_in_memory_db().unwrap();
+        let r = add_root(&conn, "/Volumes/Backup", RootKind::Nas).unwrap();
+
+        // Path under the root.
+        let hit = find_root_for_path(&conn, "/Volumes/Backup/2026/notes.txt")
+            .unwrap()
+            .expect("expected a match");
+        assert_eq!(hit.id, r.id);
+
+        // Path equal to the root path itself.
+        let exact = find_root_for_path(&conn, "/Volumes/Backup")
+            .unwrap()
+            .expect("root path should match itself");
+        assert_eq!(exact.id, r.id);
+    }
+
+    #[test]
+    fn find_root_for_path_returns_none_for_unowned_path() {
+        let conn = init_in_memory_db().unwrap();
+        add_root(&conn, "/Volumes/Backup", RootKind::Nas).unwrap();
+        let none = find_root_for_path(&conn, "/Users/keychron/Other").unwrap();
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn find_root_for_path_picks_longest_match_for_nested_roots() {
+        let conn = init_in_memory_db().unwrap();
+        let outer = add_root(&conn, "/Volumes", RootKind::Nas).unwrap();
+        let inner = add_root(&conn, "/Volumes/Backup", RootKind::Nas).unwrap();
+
+        let hit = find_root_for_path(&conn, "/Volumes/Backup/x.txt")
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.id, inner.id, "longest matching root must win");
+
+        let outer_hit = find_root_for_path(&conn, "/Volumes/Other.dmg")
+            .unwrap()
+            .unwrap();
+        assert_eq!(outer_hit.id, outer.id);
+    }
+
+    #[test]
+    fn find_root_for_path_does_not_match_sibling_prefix() {
+        let conn = init_in_memory_db().unwrap();
+        add_root(&conn, "/Users/me/Photos", RootKind::Local).unwrap();
+        // "/Users/me/PhotosArchive/x" must NOT match "/Users/me/Photos".
+        let none = find_root_for_path(&conn, "/Users/me/PhotosArchive/x").unwrap();
+        assert!(
+            none.is_none(),
+            "prefix-without-slash must not be treated as a parent"
+        );
     }
 
     #[test]

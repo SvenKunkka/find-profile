@@ -5,7 +5,7 @@ use std::sync::MutexGuard;
 use rusqlite::Connection;
 use tauri::State;
 
-use crate::db::{self, FileHit, Root, ScanJob};
+use crate::db::{self, FileHit, Root, RootKind, RootStatus, ScanJob};
 use crate::roots::register_root;
 use crate::scanner::{self, ScanInput};
 
@@ -118,13 +118,54 @@ pub fn search_files(
 }
 
 #[tauri::command]
-pub fn open_file(path: String) -> CommandResult<()> {
+pub fn open_file(state: State<'_, AppState>, path: String) -> CommandResult<()> {
+    {
+        let conn = lock_conn(&state)?;
+        check_root_reachable(&conn, &path)?;
+    }
     open_with_macos(&path, /* reveal */ false)
 }
 
 #[tauri::command]
-pub fn reveal_in_finder(path: String) -> CommandResult<()> {
+pub fn reveal_in_finder(state: State<'_, AppState>, path: String) -> CommandResult<()> {
+    {
+        let conn = lock_conn(&state)?;
+        check_root_reachable(&conn, &path)?;
+    }
     open_with_macos(&path, /* reveal */ true)
+}
+
+/// Reject open/reveal early when the path lives under a root that is currently
+/// disconnected or in error state.
+///
+/// The asymmetry between NAS and local roots is deliberate: a disconnected NAS
+/// is the common, transient case the MVP should handle gracefully (the UI can
+/// instruct the user to reconnect and rescan), so it gets its own error code
+/// `nas_unavailable`. A local root in error state is a less common situation
+/// and falls under the broader `root_unavailable` code.
+pub(crate) fn check_root_reachable(conn: &Connection, path: &str) -> CommandResult<()> {
+    let Some(root) = db::find_root_for_path(conn, path)? else {
+        // Path does not belong to any registered root; let the OS layer decide.
+        return Ok(());
+    };
+    match root.status {
+        RootStatus::Available | RootStatus::Scanning => Ok(()),
+        RootStatus::Disconnected if root.kind == RootKind::Nas => Err(CommandError::new(
+            "nas_unavailable",
+            format!(
+                "NAS root '{}' is currently disconnected. Reconnect the volume and click Scan to refresh.",
+                root.path
+            ),
+        )),
+        RootStatus::Disconnected => Err(CommandError::new(
+            "root_unavailable",
+            format!("Root '{}' is currently disconnected.", root.path),
+        )),
+        RootStatus::Error => Err(CommandError::new(
+            "root_unavailable",
+            format!("Root '{}' is in error state; rescan it before opening files.", root.path),
+        )),
+    }
 }
 
 fn open_with_macos(path: &str, reveal: bool) -> CommandResult<()> {

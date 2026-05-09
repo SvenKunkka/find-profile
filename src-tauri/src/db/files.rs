@@ -62,9 +62,11 @@ pub fn remove_file(conn: &Connection, path: &str) -> Result<()> {
 
 const SEARCH_SQL: &str = r#"
 SELECT f.id, f.root_id, f.path, f.name, f.extension, f.size, f.modified_at,
-       f.is_dir, f.source_kind, f.is_accessible, f.indexed_at
+       f.is_dir, f.source_kind, f.is_accessible, f.indexed_at,
+       r.status AS root_status
 FROM files_fts fts
 JOIN files f ON f.id = fts.rowid
+JOIN roots r ON r.id = f.root_id
 WHERE files_fts MATCH ?1
 ORDER BY rank
 LIMIT ?2 OFFSET ?3
@@ -94,6 +96,7 @@ pub fn search_files(
             source_kind: row.get(8)?,
             is_accessible: row.get::<_, i64>(9)? != 0,
             indexed_at: row.get(10)?,
+            root_status: row.get(11)?,
         })
     })?;
     let mut out = Vec::new();

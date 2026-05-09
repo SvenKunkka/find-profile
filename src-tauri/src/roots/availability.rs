@@ -32,3 +32,35 @@ pub fn decide_status_from_accessibility(kind: RootKind, accessible: bool) -> Roo
         }
     }
 }
+
+/// Whether a root of this kind should be subscribed to a filesystem watcher.
+///
+/// Local roots benefit from FSEvents/inotify-style live updates. NAS roots
+/// must NOT be watched: macOS FSEvents on SMB/AFP mounts is unreliable, and
+/// fsnotify-style mechanisms over network filesystems either silently miss
+/// events or fire spurious ones. NAS roots rely on manual `Scan` (and, in
+/// future, scheduled scans) instead.
+pub fn should_watch_root(kind: RootKind) -> bool {
+    match kind {
+        RootKind::Local => true,
+        RootKind::Nas => false,
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    #[test]
+    fn local_roots_get_a_watcher() {
+        assert!(should_watch_root(RootKind::Local));
+    }
+
+    #[test]
+    fn nas_roots_must_never_be_watched() {
+        assert!(
+            !should_watch_root(RootKind::Nas),
+            "NAS roots must rely on manual / scheduled scans, never on FS watchers"
+        );
+    }
+}

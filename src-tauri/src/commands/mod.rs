@@ -12,7 +12,10 @@ pub use state::AppState;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::DbError;
+    use super::handlers::check_root_reachable;
+    use crate::db::{
+        add_root, init_in_memory_db, update_root_status, DbError, RootKind, RootStatus,
+    };
     use crate::roots::RootError;
 
     #[test]
@@ -47,5 +50,64 @@ mod tests {
         let e: CommandError = std::io::Error::new(std::io::ErrorKind::NotFound, "boom").into();
         assert_eq!(e.code, "io");
         assert!(e.message.contains("boom"));
+    }
+
+    #[test]
+    fn check_root_reachable_allows_paths_without_a_registered_root() {
+        let conn = init_in_memory_db().unwrap();
+        // No roots registered — opening any path is allowed (OS layer decides).
+        check_root_reachable(&conn, "/Users/me/somewhere/else.txt").unwrap();
+    }
+
+    #[test]
+    fn check_root_reachable_allows_available_and_scanning_roots() {
+        let conn = init_in_memory_db().unwrap();
+        let r = add_root(&conn, "/Users/me/Code", RootKind::Local).unwrap();
+        check_root_reachable(&conn, "/Users/me/Code/main.rs").unwrap();
+
+        update_root_status(&conn, r.id, RootStatus::Scanning).unwrap();
+        check_root_reachable(&conn, "/Users/me/Code/main.rs").unwrap();
+    }
+
+    #[test]
+    fn check_root_reachable_returns_nas_unavailable_for_disconnected_nas() {
+        let conn = init_in_memory_db().unwrap();
+        let r = add_root(&conn, "/Volumes/Backup", RootKind::Nas).unwrap();
+        update_root_status(&conn, r.id, RootStatus::Disconnected).unwrap();
+
+        let err = check_root_reachable(&conn, "/Volumes/Backup/2026/notes.txt").unwrap_err();
+        assert_eq!(err.code, "nas_unavailable");
+        assert!(
+            err.message.contains("/Volumes/Backup"),
+            "message should reference the NAS root path: {}",
+            err.message
+        );
+        assert!(
+            err.message.to_lowercase().contains("scan")
+                || err.message.to_lowercase().contains("rescan"),
+            "message should hint that the user should rescan after reconnecting: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn check_root_reachable_returns_root_unavailable_for_local_error_state() {
+        let conn = init_in_memory_db().unwrap();
+        let r = add_root(&conn, "/Users/me/Old", RootKind::Local).unwrap();
+        update_root_status(&conn, r.id, RootStatus::Error).unwrap();
+
+        let err = check_root_reachable(&conn, "/Users/me/Old/x").unwrap_err();
+        assert_eq!(err.code, "root_unavailable");
+    }
+
+    #[test]
+    fn check_root_reachable_returns_root_unavailable_for_disconnected_local() {
+        let conn = init_in_memory_db().unwrap();
+        let r = add_root(&conn, "/Users/me/Old", RootKind::Local).unwrap();
+        update_root_status(&conn, r.id, RootStatus::Disconnected).unwrap();
+
+        let err = check_root_reachable(&conn, "/Users/me/Old/x").unwrap_err();
+        // Local disconnected goes via the generic root_unavailable code, not nas_unavailable.
+        assert_eq!(err.code, "root_unavailable");
     }
 }
