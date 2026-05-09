@@ -62,6 +62,92 @@ pub fn remove_file(conn: &Connection, path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Subset of `files` columns that the scanner uses to decide whether a
+/// previously-indexed entry is still up to date. Loading just these columns
+/// (instead of full `FileMetadata`) keeps the per-root memory footprint small
+/// even for million-entry roots.
+#[derive(Debug, Clone)]
+pub struct FileSnapshot {
+    pub size: Option<i64>,
+    pub modified_at: Option<String>,
+    pub is_dir: bool,
+}
+
+/// Load every indexed entry for `root_id` into a `(path → snapshot)` map.
+///
+/// Used by the scanner's incremental flow: while walking the filesystem we
+/// `remove()` each entry we still see; whatever remains in the map at the
+/// end is now missing and gets marked inaccessible (only when the walk
+/// completed cleanly — see `scan_cancellable`).
+pub fn load_root_file_index(
+    conn: &Connection,
+    root_id: i64,
+) -> Result<std::collections::HashMap<String, FileSnapshot>> {
+    let mut stmt = conn.prepare(
+        "SELECT path, size, modified_at, is_dir FROM files WHERE root_id = ?1",
+    )?;
+    let rows = stmt.query_map(params![root_id], |row| {
+        let path: String = row.get(0)?;
+        let snap = FileSnapshot {
+            size: row.get(1)?,
+            modified_at: row.get(2)?,
+            is_dir: row.get::<_, i64>(3)? != 0,
+        };
+        Ok((path, snap))
+    })?;
+    let mut map = std::collections::HashMap::new();
+    for r in rows {
+        let (p, s) = r?;
+        map.insert(p, s);
+    }
+    Ok(map)
+}
+
+/// Mark a batch of paths under `root_id` as `is_accessible = 0` without
+/// deleting their FTS rows. Used when the scanner finishes a successful walk
+/// and the leftover paths in `load_root_file_index`'s map must be flagged as
+/// no-longer-present on disk.
+///
+/// We never call this on cancellation or preflight failure — both leave the
+/// index untouched so old data stays usable.
+pub fn mark_files_inaccessible(
+    tx: &Transaction<'_>,
+    root_id: i64,
+    paths: &[String],
+) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let now = now_iso();
+    // Chunk so we never produce a query with > 999 placeholders (SQLite's
+    // default `SQLITE_MAX_VARIABLE_NUMBER`). 500 leaves headroom for the
+    // fixed parameters and matches the scanner's batch size.
+    const CHUNK: usize = 500;
+    for chunk in paths.chunks(CHUNK) {
+        // Param order: now (1), root_id (2), then one path per slot.
+        let mut placeholders = String::new();
+        for i in 0..chunk.len() {
+            if i > 0 {
+                placeholders.push(',');
+            }
+            placeholders.push_str(&format!("?{}", i + 3));
+        }
+        let sql = format!(
+            "UPDATE files SET is_accessible = 0, indexed_at = ?1
+             WHERE root_id = ?2 AND path IN ({placeholders})"
+        );
+        let mut stmt = tx.prepare(&sql)?;
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 2);
+        params.push(rusqlite::types::Value::Text(now.clone()));
+        params.push(rusqlite::types::Value::Integer(root_id));
+        for p in chunk {
+            params.push(rusqlite::types::Value::Text(p.clone()));
+        }
+        stmt.execute(params_from_iter(params.iter()))?;
+    }
+    Ok(())
+}
+
 const SEARCH_SELECT: &str = "SELECT f.id, f.root_id, f.path, f.name, f.extension, f.size, f.modified_at,
        f.is_dir, f.source_kind, f.is_accessible, f.indexed_at,
        r.status AS root_status

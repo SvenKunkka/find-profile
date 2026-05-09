@@ -11,12 +11,19 @@ pub use state::AppState;
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
     use super::*;
-    use super::handlers::check_root_reachable;
+    use super::handlers::{check_root_reachable, scan_all_roots_inner, ScanStatus};
     use crate::db::{
-        add_root, init_in_memory_db, update_root_status, DbError, RootKind, RootStatus,
+        add_root, create_scan_job, finish_scan_job, init_in_memory_db, list_roots,
+        update_root_status, update_scan_job_estimated_total, update_scan_job_progress, DbError,
+        RootKind, RootStatus, ScanJob, ScanJobStatus,
     };
-    use crate::roots::RootError;
+    use crate::roots::{register_root, RootError};
 
     #[test]
     fn command_error_serializes_with_code_and_message() {
@@ -109,5 +116,252 @@ mod tests {
         let err = check_root_reachable(&conn, "/Users/me/Old/x").unwrap_err();
         // Local disconnected goes via the generic root_unavailable code, not nas_unavailable.
         assert_eq!(err.code, "root_unavailable");
+    }
+
+    // --- ScanStatus / progress_percent ----------------------------------
+
+    fn fake_job(scanned: i64, estimated: Option<i64>) -> ScanJob {
+        ScanJob {
+            id: 1,
+            root_id: 1,
+            status: ScanJobStatus::Running,
+            scanned_count: scanned,
+            error_count: 0,
+            estimated_total_count: estimated,
+            current_path: None,
+            started_at: "2026-05-09T00:00:00Z".into(),
+            finished_at: None,
+            error_message: None,
+        }
+    }
+
+    #[test]
+    fn scan_status_progress_percent_basic_ratio() {
+        let s = ScanStatus::from_job(fake_job(50, Some(100)));
+        assert_eq!(s.progress_percent, 50);
+    }
+
+    #[test]
+    fn scan_status_progress_percent_clamps_to_100_when_scanned_exceeds_estimate() {
+        let s = ScanStatus::from_job(fake_job(120, Some(100)));
+        assert_eq!(s.progress_percent, 100);
+    }
+
+    #[test]
+    fn scan_status_progress_percent_zero_when_estimate_missing() {
+        let s = ScanStatus::from_job(fake_job(50, None));
+        assert_eq!(s.progress_percent, 0);
+        let s = ScanStatus::from_job(fake_job(50, Some(0)));
+        assert_eq!(s.progress_percent, 0);
+    }
+
+    #[test]
+    fn scan_status_progress_percent_zero_at_start() {
+        let s = ScanStatus::from_job(fake_job(0, Some(1000)));
+        assert_eq!(s.progress_percent, 0);
+    }
+
+    // --- scan_all_roots_inner -------------------------------------------
+
+    fn unique_test_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let p = std::env::temp_dir().join(format!(
+            "find_profile_cmd_test_{}_{}_{}",
+            label,
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn cleanup(p: &PathBuf) {
+        let _ = fs::remove_dir_all(p);
+    }
+
+    fn wait_for_status(
+        conn: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+        root_id: i64,
+        target: RootStatus,
+        deadline: Instant,
+    ) -> bool {
+        while Instant::now() < deadline {
+            let g = conn.lock().unwrap();
+            let r = list_roots(&g).unwrap();
+            if let Some(root) = r.iter().find(|r| r.id == root_id) {
+                if root.status == target {
+                    return true;
+                }
+            }
+            drop(g);
+            std::thread::sleep(Duration::from_millis(80));
+        }
+        false
+    }
+
+    #[test]
+    fn scan_all_roots_skips_disabled_roots() {
+        let dir = unique_test_dir("scan_all_disabled");
+        fs::write(dir.join("a.txt"), b"a").unwrap();
+        let conn = init_in_memory_db().unwrap();
+        let r = register_root(&conn, dir.to_str().unwrap(), Some("local")).unwrap();
+        crate::db::disable_root(&conn, r.id).unwrap();
+
+        let state = AppState::new(conn);
+        let spawned = scan_all_roots_inner(&state).unwrap();
+        assert_eq!(spawned, 0, "disabled roots must not be auto-scanned");
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn scan_all_roots_skips_already_active_root() {
+        let dir = unique_test_dir("scan_all_busy");
+        fs::write(dir.join("a.txt"), b"a").unwrap();
+        let conn = init_in_memory_db().unwrap();
+        let r = register_root(&conn, dir.to_str().unwrap(), Some("local")).unwrap();
+
+        let state = AppState::new(conn);
+        // Pretend the root is already mid-scan by registering its cancel token.
+        state.scan_cancellations.register(r.id);
+
+        let spawned = scan_all_roots_inner(&state).unwrap();
+        assert_eq!(spawned, 0, "active scans must be skipped, not duplicated");
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn scan_all_roots_spawns_for_enabled_local_root_and_completes() {
+        let dir = unique_test_dir("scan_all_run");
+        fs::write(dir.join("alpha.txt"), b"a").unwrap();
+        fs::write(dir.join("beta.txt"), b"b").unwrap();
+
+        let conn = init_in_memory_db().unwrap();
+        let r = register_root(&conn, dir.to_str().unwrap(), Some("local")).unwrap();
+
+        let state = AppState::new(conn);
+        let spawned = scan_all_roots_inner(&state).unwrap();
+        assert_eq!(spawned, 1);
+
+        let conn_arc = state.conn.clone();
+        // Worker should complete and flip status back to Available within 5s.
+        let ok = wait_for_status(
+            &conn_arc,
+            r.id,
+            RootStatus::Available,
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert!(ok, "worker should finish and restore Available status");
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn scan_all_roots_continues_after_one_root_fails() {
+        // Mix one bogus path (will fail preflight → status=Error) with a real
+        // local dir; both must get a spawn, and the real one must complete.
+        let bogus = format!(
+            "/tmp/__find_profile_scan_all_missing_{}_{}__",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let real = unique_test_dir("scan_all_mix");
+        fs::write(real.join("ok.txt"), b"ok").unwrap();
+
+        let conn = init_in_memory_db().unwrap();
+        let bogus_root = register_root(&conn, &bogus, Some("local")).unwrap();
+        let real_root = register_root(&conn, real.to_str().unwrap(), Some("local")).unwrap();
+
+        let state = AppState::new(conn);
+        let spawned = scan_all_roots_inner(&state).unwrap();
+        assert_eq!(spawned, 2, "both spawns are issued; failures happen in workers");
+
+        let conn_arc = state.conn.clone();
+        let real_ok = wait_for_status(
+            &conn_arc,
+            real_root.id,
+            RootStatus::Available,
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert!(real_ok, "real root should still complete despite bogus root failure");
+
+        let bogus_ok = wait_for_status(
+            &conn_arc,
+            bogus_root.id,
+            RootStatus::Error,
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert!(bogus_ok, "bogus local root should land in Error state");
+
+        cleanup(&real);
+    }
+
+    // --- scanner side: estimated_total_count populated ------------------
+
+    #[test]
+    fn scan_populates_estimated_total_count_on_rescan() {
+        // First scan: index is empty, so we have no prior count to derive a
+        // percentage from. Subsequent scans use the previous indexed count
+        // as the estimate, which lets the UI render xx% during a rescan.
+        let dir = unique_test_dir("scan_estimate");
+        fs::write(dir.join("a.txt"), b"a").unwrap();
+        fs::write(dir.join("b.txt"), b"b").unwrap();
+        fs::write(dir.join("c.txt"), b"c").unwrap();
+
+        let conn = init_in_memory_db().unwrap();
+        let r = register_root(&conn, dir.to_str().unwrap(), Some("local")).unwrap();
+        let conn_arc = Arc::new(std::sync::Mutex::new(conn));
+        let input = crate::scanner::ScanInput {
+            root_id: r.id,
+            root_path: r.path.clone(),
+            source_kind: r.kind,
+        };
+
+        let first = crate::scanner::scan(conn_arc.clone(), input.clone(), |_| {}).unwrap();
+        assert_eq!(first.status, ScanJobStatus::Success);
+
+        // After the first scan there was no prior index, so estimate stays
+        // None and progress_percent falls through to 0 (UI shows the "已扫描
+        // N 项" fallback instead).
+        {
+            let g = conn_arc.lock().unwrap();
+            let job = crate::db::get_latest_scan_job_for_root(&g, r.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.estimated_total_count, None);
+            let s = ScanStatus::from_job(job);
+            assert_eq!(s.progress_percent, 0);
+        }
+
+        // Rescan: the previous indexed count seeds the estimate, so a fully-
+        // scanned tree reports 100%.
+        let second = crate::scanner::scan(conn_arc.clone(), input, |_| {}).unwrap();
+        assert_eq!(second.status, ScanJobStatus::Success);
+        let g = conn_arc.lock().unwrap();
+        let job = crate::db::get_latest_scan_job_for_root(&g, r.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.estimated_total_count, Some(first.scanned_count));
+        let s = ScanStatus::from_job(job);
+        assert_eq!(s.progress_percent, 100);
+
+        drop(g);
+        cleanup(&dir);
+    }
+
+    // Helpers used solely so the imports above are referenced.
+    #[allow(dead_code)]
+    fn _force_imports() {
+        let _ = create_scan_job;
+        let _ = finish_scan_job;
+        let _ = update_scan_job_estimated_total;
+        let _ = update_scan_job_progress;
     }
 }

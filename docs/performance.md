@@ -114,11 +114,44 @@ println!("{} hits in {:?}", hits.len(), dt);
 - 没有 query cache。每次搜索都是新的 prepare + bm25 计算。MVP 数据量级可接受。
 - 没有 CI 性能门禁。这份文档是 dev 自检清单，不接到测试套件里。当前 `cargo test` 套件覆盖功能正确性 + 取消语义，不覆盖 100k 性能数字。
 
-## 6. 出问题先看哪里
+## 6. 2026-05 性能优化清单
+
+第一版扫描器在大目录（百万级，NAS 上更明显）上有两个主要瓶颈：(1) 任何时候点 Scan/启动 app 都跑一遍 Phase-1 pre-walk 计数，等于把整棵树走两遍；(2) 启动时同时对所有 root 触发并发扫描，导致磁盘和 SQLite 互锁互相拖累。下面这一组改动同时落地，目标是把"重复扫描"和"启动扫描"两个最常见路径的耗时显著降下来。
+
+| 优化 | 影响 | 源代码 |
+| --- | --- | --- |
+| **SQLite PRAGMA 调优** | WAL + synchronous=NORMAL → 扫描期间搜索几乎零等待；temp_store=MEMORY、cache_size=-65536 (64 MB) → FTS posting list 构建不再压本地磁盘 | `src-tauri/src/db/mod.rs::configure` |
+| **删除 Phase-1 pre-walk 计数** | 直接砍掉一整轮 readdir 流量。NAS 上肉眼可感知（少一轮往返） | `src-tauri/src/scanner/mod.rs::scan_cancellable` |
+| **HashMap 增量扫描** | 启动时把当前 root 的索引读进 `HashMap<path, FileSnapshot>`，walker 边走边 `remove()`：metadata 全等 → 跳过 upsert（典型 no-op rescan 提速 ≥ 20×）；剩在 map 里的就是磁盘上消失了的，一次性 `mark_files_inaccessible` 标记不可用而不删行 | `scan_cancellable` + `db::load_root_file_index` + `db::mark_files_inaccessible` |
+| **顺序队列自动扫描** | `start_scan_all_roots` / `rebuild_index` 不再 N 个 root N 个线程，而是入一个队列、单 worker 串行处理。NAS 慢扫不会再卡 local 快扫的 mutex/磁盘带宽 | `src-tauri/src/commands/handlers.rs::scan_all_roots_inner` |
+| **`try_register` 防双扫** | 用户连点 Scan 或自动扫描和手动扫描相撞时，第二次进入 `spawn_scan` 直接 no-op，不再把第一个 worker 的 cancel token 顶掉变成孤儿 | `src-tauri/src/scanner/cancel.rs::try_register` |
+| **前端 roots 比较** | 1 秒一次的扫描进度轮询不再在每次 tick 都触发整表重渲染：只有 `id/path/kind/enabled/status` 真正变化才 `setRoots`，进度 % 走单独的 `scanStatuses` state | `src/App.tsx::rootsChanged` |
+| **首次扫描进度文案** | 第一次扫一个 root 时没有"上一次的 count"可以推 %，前端改为显示 `已扫描 N 项` 而不是干转圈 | `src/App.tsx` 的 `scan-progress` 渲染 |
+
+### 6.1 关键不变量（增量扫描下仍然成立）
+
+- **取消绝不破坏索引：** `scan_cancellable` 在 cancelled 分支跳过 `mark_files_inaccessible`。半途 cancel 后旧数据原样保留。
+- **NAS 断开绝不破坏索引：** preflight 失败的 root 直接 `Failed → Disconnected`，根本不走入增量循环，`mark_files_inaccessible` 不会触达。
+- **mark-missing 不删行：** 缺失文件只把 `is_accessible = 0` 置位 + 刷 `indexed_at`，FTS 行保留，搜索能继续命中（前端会把它们渲染为 `不可用`）。
+
+### 6.2 这些优化的覆盖测试
+
+| 行为 | 测试 |
+| --- | --- |
+| 重扫不变文件不再 upsert | `scanner::tests::unchanged_rescan_does_not_bump_indexed_at` |
+| 删除文件后重扫被 mark inaccessible（不删行） | `scanner::tests::rescan_marks_deleted_files_inaccessible_and_keeps_their_row` |
+| cancel 路径不 mark missing | `scanner::tests::cancelled_rescan_does_not_mark_missing` |
+| NAS preflight 失败不 mark missing | `scanner::tests::nas_disconnected_preflight_does_not_mark_missing` |
+| 首次扫描 estimated_total = None / 重扫为 Some(prev) | `commands::tests::scan_populates_estimated_total_count_on_rescan` |
+| `try_register` 防重入 | `scanner::cancel::tests::try_register_returns_none_when_already_active` |
+
+## 7. 出问题先看哪里
 
 | 症状 | 第一手怀疑 |
 | --- | --- |
 | 100k 扫描卡死 | 看 scan_jobs.error_count；如果 walker 在某个目录上 retry，可能权限 / FS 错误循环 |
 | UI 冻结 | DevTools Performance 录一段；找最长的 invoke 等待。98% 是某个长 lock hold —— 看 scanner 的 batch / flush 是否被改坏 |
 | 搜索慢 | 用 EXPLAIN QUERY PLAN 看 SQL；确认 fts5 MATCH 走 fts 表而不是全表扫；确认 ORDER BY bm25 没被改成全表排序 |
-| 取消不响应 | 检查 worker 线程是否真的拿到了 cancel token；`ScanCancellations::register` 在每次 spawn_scan 入口都调；CMD `cancel_scan` 返回 `false` 说明 token 已被 clear（scan 已完成） |
+| 取消不响应 | 检查 worker 线程是否真的拿到了 cancel token；`ScanCancellations::try_register` 在每次 spawn_scan 入口都调；CMD `cancel_scan` 返回 `false` 说明 token 已被 clear（scan 已完成） |
+| 重扫还是慢 | 看 scan_jobs 最近一条的 estimated_total_count 和 scanned_count 比例。如果接近 1:1 但耗时仍长，多半是 metadata 真的变了（modified_at 漂移）—— 用 `stat` 或 `find -newer` 直接对照磁盘上的文件 |
+| 启动后看到多个 root 同时 scanning | 不应再出现：自动扫描进了单 worker 队列。如果出现，多半是同时手点了 Scan 按钮（手动 `start_scan` 仍会单独 spawn）—— 这是预期行为 |

@@ -35,12 +35,16 @@ interface FileHit {
   root_status: RootStatus;
 }
 
-interface ScanJob {
-  id: number;
+interface ScanStatus {
   root_id: number;
+  job_id: number;
   status: "running" | "success" | "failed" | "cancelled";
   scanned_count: number;
   error_count: number;
+  estimated_total_count: number | null;
+  /** 0..=100, derived on the backend. 0 while the count phase is running. */
+  progress_percent: number;
+  current_path: string | null;
   started_at: string;
   finished_at: string | null;
   error_message: string | null;
@@ -63,8 +67,7 @@ interface AppPaths {
 
 const SEARCH_DEBOUNCE_MS = 200;
 const PAGE_SIZE = 50;
-const SCAN_POLL_MS = 1500;
-const SCAN_POLL_TIMEOUT_MS = 5 * 60 * 1000;
+const SCAN_POLL_MS = 1000;
 
 /**
  * Map a Tauri CommandError (or anything else thrown out of invoke()) to a
@@ -206,6 +209,16 @@ function App() {
   const [appPaths, setAppPaths] = useState<AppPaths | null>(null);
   const [settingsBusy, setSettingsBusy] = useState(false);
 
+  // Per-root scan progress (only populated for roots with status=scanning).
+  const [scanStatuses, setScanStatuses] = useState<Record<number, ScanStatus>>(
+    {}
+  );
+  // True while the launch-time auto-scan is still finishing — surfaces the
+  // status-bar hint "正在后台扫描已添加目录...".
+  const [autoScanning, setAutoScanning] = useState(false);
+
+  const hasScanningRoot = roots.some((r) => r.status === "scanning");
+
   const extensions = useMemo(
     () => parseExtensionInput(extensionInput),
     [extensionInput]
@@ -216,10 +229,35 @@ function App() {
     setPage(0);
   }, [query, extensionInput, sourceFilter, typeFilter, sortBy]);
 
+  /**
+   * Returns true when the visible-to-the-user fields of two root snapshots
+   * differ. Used by the polling effect to suppress identity-only setRoots
+   * calls (which would re-render the whole results table just to re-paint
+   * an unchanged sidebar). This is a hot path during scan because polling
+   * fires every 1s.
+   */
+  function rootsChanged(a: Root[], b: Root[]): boolean {
+    if (a.length !== b.length) return true;
+    for (let i = 0; i < a.length; i += 1) {
+      const x = a[i];
+      const y = b[i];
+      if (
+        x.id !== y.id ||
+        x.path !== y.path ||
+        x.kind !== y.kind ||
+        x.enabled !== y.enabled ||
+        x.status !== y.status
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   async function refreshRoots() {
     try {
       const next = await invoke<Root[]>("list_index_roots");
-      setRoots(next);
+      setRoots((prev) => (rootsChanged(prev, next) ? next : prev));
       setCurrentRoot((prev) =>
         prev ? next.find((r) => r.id === prev.id) ?? null : prev
       );
@@ -230,8 +268,71 @@ function App() {
   }
 
   useEffect(() => {
-    void refreshRoots();
+    (async () => {
+      await refreshRoots();
+      // Auto-scan every enabled root in the background. spawn_scan is non-
+      // blocking; the global poll below picks up progress as workers run.
+      try {
+        const spawned = await invoke<number>("start_scan_all_roots");
+        if (spawned > 0) {
+          setAutoScanning(true);
+        }
+      } catch (e) {
+        console.error("start_scan_all_roots failed", e);
+        // Do not surface to UI; per-root errors land in scan_jobs and the
+        // status badge already shows them as "错误" / "已断开".
+      }
+    })();
   }, []);
+
+  // Global scan-progress poll. Active only while any root is scanning, so
+  // searching against a quiet index doesn't pay the polling cost.
+  useEffect(() => {
+    if (!hasScanningRoot) {
+      // Clean up percent badges as soon as no roots are scanning.
+      if (Object.keys(scanStatuses).length > 0) {
+        setScanStatuses({});
+      }
+      if (autoScanning) {
+        setAutoScanning(false);
+      }
+      return;
+    }
+    const tick = window.setInterval(() => {
+      (async () => {
+        try {
+          const next = await invoke<Root[]>("list_index_roots");
+          // Avoid re-rendering the results table on every poll tick when
+          // only the scan progress changed (progress lives in scanStatuses,
+          // not roots).
+          setRoots((prev) => (rootsChanged(prev, next) ? next : prev));
+          const scanning = next.filter((r) => r.status === "scanning");
+          // Fan out per-root status fetches in parallel.
+          const entries = await Promise.all(
+            scanning.map(async (r) => {
+              try {
+                const s = await invoke<ScanStatus | null>("get_scan_status", {
+                  rootId: r.id,
+                });
+                return s && s.status === "running" ? ([r.id, s] as const) : null;
+              } catch (err) {
+                console.error("get_scan_status failed", err);
+                return null;
+              }
+            })
+          );
+          const map: Record<number, ScanStatus> = {};
+          for (const e of entries) {
+            if (e) map[e[0]] = e[1];
+          }
+          setScanStatuses(map);
+        } catch (err) {
+          console.error("scan poll failed", err);
+        }
+      })();
+    }, SCAN_POLL_MS);
+    return () => window.clearInterval(tick);
+  }, [hasScanningRoot]);
 
   // Debounced search. Re-runs on any filter / sort / page change.
   useEffect(() => {
@@ -327,25 +428,7 @@ function App() {
     try {
       await invoke("start_scan", { rootId });
       await refreshRoots();
-
-      const start = Date.now();
-      const tick = window.setInterval(() => {
-        (async () => {
-          try {
-            await refreshRoots();
-            const job = await invoke<ScanJob | null>("get_scan_status", {
-              rootId,
-            });
-            const stillRunning = job != null && job.status === "running";
-            if (!stillRunning || Date.now() - start > SCAN_POLL_TIMEOUT_MS) {
-              window.clearInterval(tick);
-            }
-          } catch (err) {
-            console.error("get_scan_status failed", err);
-            window.clearInterval(tick);
-          }
-        })();
-      }, SCAN_POLL_MS);
+      // Global polling effect picks up status / percent updates from here.
     } catch (e) {
       console.error("start_scan failed", e);
       setError(`扫描目录失败：${translateError(e)}`);
@@ -539,6 +622,31 @@ function App() {
                     <span className={`root-status status-${r.status}`}>
                       {rootStatusLabel(r.status)}
                     </span>
+                    {r.status === "scanning" && (
+                      <span
+                        className="scan-progress"
+                        title={
+                          scanStatuses[r.id]?.current_path ?? undefined
+                        }
+                      >
+                        {(() => {
+                          const s = scanStatuses[r.id];
+                          if (!s) return "扫描中...";
+                          // First-ever scan of this root: no prior count to
+                          // turn into a percentage. Surface live row count
+                          // instead so the user still sees forward progress.
+                          if (
+                            s.estimated_total_count == null ||
+                            s.estimated_total_count <= 0
+                          ) {
+                            return s.scanned_count > 0
+                              ? `已扫描 ${s.scanned_count} 项`
+                              : "扫描中...";
+                          }
+                          return `${s.progress_percent}%`;
+                        })()}
+                      </span>
+                    )}
                     <button
                       type="button"
                       className={`btn-scan ${
@@ -760,10 +868,13 @@ function App() {
         <div className="status-cell">
           <span className="status-label">状态</span>
           <span className="status-value">
-            就绪 · {roots.length} 个根目录
-            {hasQuery && searched
-              ? ` · 第 ${page + 1} 页：${results.length} 条`
-              : ""}
+            {autoScanning && hasScanningRoot
+              ? "正在后台扫描已添加目录..."
+              : `就绪 · ${roots.length} 个根目录${
+                  hasQuery && searched
+                    ? ` · 第 ${page + 1} 页：${results.length} 条`
+                    : ""
+                }`}
           </span>
         </div>
         <div className="status-cell">

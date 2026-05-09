@@ -2,6 +2,7 @@ pub mod cancel;
 pub mod error;
 mod extract;
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -10,7 +11,9 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
-use crate::db::{self, DbError, FileMetadata, RootKind, RootStatus, ScanJobStatus};
+use crate::db::{
+    self, DbError, FileMetadata, FileSnapshot, RootKind, RootStatus, ScanJobStatus,
+};
 use crate::roots::{decide_status_from_accessibility, probe_path_accessibility};
 
 pub use cancel::ScanCancellations;
@@ -154,6 +157,37 @@ pub fn scan_cancellable(
         db::update_root_status(&g, input.root_id, RootStatus::Scanning)?;
     }
 
+    // Incremental-scan setup.
+    //
+    // Instead of a Phase-1 pre-walk that double-traverses the tree just to
+    // produce a row count, we load the previous index for this root into a
+    // HashMap up front. During the walk we `remove()` each entry as we see
+    // it; whatever remains at the end is now missing on disk and gets a
+    // single bulk UPDATE marking it inaccessible (only on a clean walk —
+    // see the `cancelled`/preflight branches below). This buys us:
+    //   - `estimated_total_count = previous_count` so the UI can render
+    //     a percentage on rescans without paying for a full pre-walk,
+    //   - a fast path for unchanged entries: if the on-disk metadata
+    //     matches what we already have, we skip the upsert entirely (the
+    //     dominant cost saving on a no-op rescan),
+    //   - mark-missing semantics that preserve the NAS invariant
+    //     (cancellation never deletes / marks anything missing).
+    let existing: HashMap<String, FileSnapshot> = {
+        let g = lock(&conn)?;
+        db::load_root_file_index(&g, input.root_id)?
+    };
+    let previous_count = existing.len() as i64;
+    if previous_count > 0 {
+        let g = lock(&conn)?;
+        db::update_scan_job_estimated_total(&g, job_id, previous_count)?;
+    }
+    tracing::info!(
+        root_id = input.root_id,
+        previous_count,
+        "scan phase 1 (load index) finished",
+    );
+
+    let mut existing = existing;
     let mut buffer: Vec<FileMetadata> = Vec::with_capacity(BATCH_SIZE);
     let mut scanned: i64 = 0;
     let mut errors: i64 = 0;
@@ -165,7 +199,13 @@ pub fn scan_cancellable(
         .follow_links(false)
         .min_depth(1);
 
-    let mut cancelled = false;
+    // Seed `cancelled` from the token's current value so a pre-cancelled
+    // scan is treated as cancelled even if the walker yields zero entries
+    // (e.g. all files were deleted between scans). Without this, an empty
+    // walker would silently fall through to the success path and trigger
+    // mark-missing on the leftover index — exactly the NAS-unsafe behavior
+    // we need to forbid.
+    let mut cancelled = cancel.load(Ordering::Relaxed);
     for entry_result in walker {
         // Cancellation check at the very top of each iteration so the worker
         // exits within one walkdir entry of the user clicking Cancel.
@@ -196,8 +236,27 @@ pub fn scan_cancellable(
                         if !m.is_dir && !filters.include_files {
                             continue;
                         }
-                        buffer.push(m);
-                        scanned += 1;
+                        // Pop any existing snapshot — even when we end up
+                        // upserting, we still want this path off the
+                        // "missing" leftover set.
+                        let prev = existing.remove(&m.path);
+                        let unchanged = matches!(
+                            prev.as_ref(),
+                            Some(s)
+                                if s.is_dir == m.is_dir
+                                    && s.size == m.size
+                                    && s.modified_at == m.modified_at
+                        );
+                        if unchanged {
+                            // Already indexed with identical metadata — skip
+                            // the upsert. This is the dominant fast path on
+                            // a no-op rescan and avoids ~20% of total scan
+                            // time per the original benchmark.
+                            scanned += 1;
+                        } else {
+                            buffer.push(m);
+                            scanned += 1;
+                        }
                     }
                     None => errors += 1,
                 }
@@ -217,7 +276,13 @@ pub fn scan_cancellable(
                 let mut g = lock(&conn)?;
                 flush_locked(&mut g, &mut buffer)?;
                 if should_emit_progress {
-                    db::update_scan_job_progress(&g, job_id, scanned, errors)?;
+                    db::update_scan_job_progress(
+                        &g,
+                        job_id,
+                        scanned,
+                        errors,
+                        current_path.as_deref(),
+                    )?;
                 }
             }
             if should_emit_progress {
@@ -234,10 +299,32 @@ pub fn scan_cancellable(
     }
 
     // Final flush + a guaranteed terminal progress emission.
+    //
+    // On a clean walk (not cancelled), `existing` still contains the paths
+    // we never re-encountered → fold them into the same transaction as
+    // mark-inaccessible. We deliberately do NOT delete them: keeping the
+    // FTS row preserves search history, and `is_accessible = 0` is what
+    // the UI surfaces as the "不可用" state.
+    let leftover_missing: Vec<String> = if cancelled {
+        Vec::new()
+    } else {
+        existing.into_keys().collect()
+    };
     {
         let mut g = lock(&conn)?;
-        flush_locked(&mut g, &mut buffer)?;
-        db::update_scan_job_progress(&g, job_id, scanned, errors)?;
+        flush_locked_with_missing(
+            &mut g,
+            &mut buffer,
+            input.root_id,
+            &leftover_missing,
+        )?;
+        db::update_scan_job_progress(
+            &g,
+            job_id,
+            scanned,
+            errors,
+            current_path.as_deref(),
+        )?;
     }
     on_progress(&Progress {
         job_id,
@@ -311,11 +398,34 @@ fn flush_locked(conn: &mut Connection, buffer: &mut Vec<FileMetadata>) -> Result
     Ok(())
 }
 
+/// Final-batch variant: commits any pending upserts AND marks the leftover
+/// "no longer present" paths as inaccessible in the same transaction. Doing
+/// it together keeps the index internally consistent if the writer crashes
+/// between the two steps.
+fn flush_locked_with_missing(
+    conn: &mut Connection,
+    buffer: &mut Vec<FileMetadata>,
+    root_id: i64,
+    missing: &[String],
+) -> Result<()> {
+    if buffer.is_empty() && missing.is_empty() {
+        return Ok(());
+    }
+    let tx = db::begin_index_transaction(conn)?;
+    for m in buffer.iter() {
+        db::upsert_file_in_transaction(&tx, m)?;
+    }
+    db::mark_files_inaccessible(&tx, root_id, missing)?;
+    tx.commit().map_err(|e| ScanError::Db(DbError::from(e)))?;
+    buffer.clear();
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -882,6 +992,236 @@ mod tests {
             "no directory entries should be indexed"
         );
         drop(g);
+        cleanup(&dir);
+    }
+
+    // --- incremental scan -----------------------------------------------
+
+    #[test]
+    fn rescan_marks_deleted_files_inaccessible_and_keeps_their_row() {
+        // After scan #1 indexes a file, deleting it on disk and rescanning
+        // must flip is_accessible to 0 — *not* delete the row. The FTS row
+        // is preserved so search history keeps working; the UI knows to
+        // render this as "不可用".
+        //
+        // Note: the walker uses min_depth(1), so the root dir itself is
+        // never indexed — only its children.
+        let dir = unique_test_dir("missing_marked");
+        fs::write(dir.join("keep.txt"), b"k").unwrap();
+        fs::write(dir.join("gone.txt"), b"g").unwrap();
+
+        let conn = make_conn();
+        let root = {
+            let g = conn.lock().unwrap();
+            register_root(&g, dir.to_str().unwrap(), Some("local")).unwrap()
+        };
+        let input = ScanInput {
+            root_id: root.id,
+            root_path: root.path.clone(),
+            source_kind: root.kind,
+        };
+        scan(conn.clone(), input.clone(), |_| {}).unwrap();
+        // Sanity: both files are indexed and accessible after first scan.
+        {
+            let g = conn.lock().unwrap();
+            let count_acc: i64 = g
+                .query_row(
+                    "SELECT COUNT(*) FROM files WHERE root_id = ?1 AND is_accessible = 1",
+                    [root.id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count_acc, 2, "both files indexed and accessible");
+        }
+
+        // Delete one file and rescan.
+        fs::remove_file(dir.join("gone.txt")).unwrap();
+        scan(conn.clone(), input, |_| {}).unwrap();
+
+        let g = conn.lock().unwrap();
+        let total: i64 = g
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE root_id = ?1",
+                [root.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 2, "missing files must NOT be deleted from index");
+        let inacc: i64 = g
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE root_id = ?1 AND is_accessible = 0",
+                [root.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(inacc, 1, "exactly the deleted file must be marked inaccessible");
+
+        // The deleted file must still be searchable (it just shows as
+        // unavailable in the UI).
+        let hits = search_files(&g, "gone", 10, 0).unwrap();
+        assert!(hits.iter().any(|h| h.name == "gone.txt" && !h.is_accessible));
+
+        drop(g);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn cancelled_rescan_does_not_mark_missing() {
+        // Hard NAS-safety invariant: a cancelled scan must never flip rows
+        // to inaccessible — the index has to stay consistent with the last
+        // *successful* scan even if the user cancels mid-flight.
+        let dir = unique_test_dir("cancel_no_mark_missing");
+        fs::write(dir.join("a.txt"), b"a").unwrap();
+        fs::write(dir.join("b.txt"), b"b").unwrap();
+
+        let conn = make_conn();
+        let root = {
+            let g = conn.lock().unwrap();
+            register_root(&g, dir.to_str().unwrap(), Some("local")).unwrap()
+        };
+        let input = ScanInput {
+            root_id: root.id,
+            root_path: root.path.clone(),
+            source_kind: root.kind,
+        };
+        // Successful first scan.
+        scan(conn.clone(), input.clone(), |_| {}).unwrap();
+        // Drop both files on disk so a clean rescan would mark all of them
+        // missing — but cancel before the walk runs.
+        fs::remove_file(dir.join("a.txt")).unwrap();
+        fs::remove_file(dir.join("b.txt")).unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(true));
+        let outcome = scan_cancellable(
+            conn.clone(),
+            input,
+            ScanFilters::default(),
+            cancel,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(outcome.status, ScanJobStatus::Cancelled);
+
+        let g = conn.lock().unwrap();
+        let inacc: i64 = g
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE root_id = ?1 AND is_accessible = 0",
+                [root.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(inacc, 0, "cancellation must not mark any row inaccessible");
+
+        drop(g);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn nas_disconnected_preflight_does_not_mark_missing() {
+        // Preflight failure for a disconnected NAS is the canonical way old
+        // index data is preserved. It must never trigger mark-missing.
+        let conn = make_conn();
+        let nas = format!(
+            "/Volumes/__find_profile_disconnected_{}_{}__",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let root = {
+            let g = conn.lock().unwrap();
+            let r = register_root(&g, &nas, None).unwrap();
+            assert_eq!(r.kind, RootKind::Nas);
+            // Pre-populate two cached entries to simulate a NAS that was
+            // previously online.
+            crate::db::upsert_file(
+                &g,
+                &cached_row(r.id, &format!("{nas}/a.bin"), "a.bin", RootKind::Nas),
+            )
+            .unwrap();
+            crate::db::upsert_file(
+                &g,
+                &cached_row(r.id, &format!("{nas}/b.bin"), "b.bin", RootKind::Nas),
+            )
+            .unwrap();
+            r
+        };
+
+        let outcome = scan(
+            conn.clone(),
+            ScanInput {
+                root_id: root.id,
+                root_path: nas.clone(),
+                source_kind: RootKind::Nas,
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(outcome.status, ScanJobStatus::Failed);
+        assert_eq!(outcome.final_root_status, RootStatus::Disconnected);
+
+        let g = conn.lock().unwrap();
+        let inacc: i64 = g
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE root_id = ?1 AND is_accessible = 0",
+                [root.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            inacc, 0,
+            "NAS-disconnected preflight must keep cached rows accessible=1",
+        );
+    }
+
+    #[test]
+    fn unchanged_rescan_does_not_bump_indexed_at() {
+        // Fast-path verification: if metadata is unchanged between scans,
+        // the row's indexed_at should NOT advance (since we skip the upsert
+        // entirely). This is the dominant savings on a no-op rescan.
+        let dir = unique_test_dir("unchanged_skip");
+        fs::write(dir.join("a.txt"), b"a").unwrap();
+
+        let conn = make_conn();
+        let root = {
+            let g = conn.lock().unwrap();
+            register_root(&g, dir.to_str().unwrap(), Some("local")).unwrap()
+        };
+        let input = ScanInput {
+            root_id: root.id,
+            root_path: root.path.clone(),
+            source_kind: root.kind,
+        };
+        scan(conn.clone(), input.clone(), |_| {}).unwrap();
+        let first_indexed_at: String = {
+            let g = conn.lock().unwrap();
+            g.query_row(
+                "SELECT indexed_at FROM files WHERE name = 'a.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        // Sleep just enough that a re-upsert would produce a different
+        // indexed_at if it happened.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        scan(conn.clone(), input, |_| {}).unwrap();
+        let second_indexed_at: String = {
+            let g = conn.lock().unwrap();
+            g.query_row(
+                "SELECT indexed_at FROM files WHERE name = 'a.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            first_indexed_at, second_indexed_at,
+            "unchanged file must not be re-upserted (skip-unchanged fast path)",
+        );
+
         cleanup(&dir);
     }
 

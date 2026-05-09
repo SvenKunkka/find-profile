@@ -9,7 +9,9 @@ use serde::Serialize;
 use tauri::AppHandle;
 use tauri::Manager;
 
-use crate::db::{self, FileHit, Root, RootKind, RootStatus, ScanJob, SearchOptions, SortBy};
+use crate::db::{
+    self, FileHit, Root, RootKind, RootStatus, ScanJob, ScanJobStatus, SearchOptions, SortBy,
+};
 use crate::roots::register_root;
 use crate::scanner::{self, ScanFilters, ScanInput};
 use crate::settings::{self, Settings};
@@ -91,9 +93,18 @@ fn spawn_scan(state: &AppState, root_id: i64) -> CommandResult<()> {
 
     tracing::info!(root_id, root_path = %root_path, ?filters, "spawn_scan");
 
-    // Register a fresh cancellation token for this scan. `cancel_scan` flips
-    // it; the worker polls it at every walker iteration.
-    let cancel = state.scan_cancellations.register(root_id);
+    // Race-free claim of the cancellation slot. If a worker is already
+    // running for this root, return Ok without spawning — the user's
+    // double-click on Scan is benign-deduplicated rather than racing two
+    // workers against the same DB rows. `cancel_scan` flips this token;
+    // the worker polls it at every walker iteration.
+    let cancel = match state.scan_cancellations.try_register(root_id) {
+        Some(t) => t,
+        None => {
+            tracing::info!(root_id, "spawn_scan: scan already in flight, skipping");
+            return Ok(());
+        }
+    };
     let conn_arc: Arc<_> = state.conn.clone();
     let cancellations = state.scan_cancellations.clone();
 
@@ -133,13 +144,145 @@ pub fn cancel_scan(state: State<'_, AppState>, root_id: i64) -> CommandResult<bo
     Ok(state.scan_cancellations.cancel(root_id))
 }
 
+/// Frontend-facing scan progress DTO. `progress_percent` is derived from
+/// `scanned_count / estimated_total_count` and clamped to `[0, 100]`. Stored
+/// `ScanJob` fields are kept verbatim so the frontend can display them too.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanStatus {
+    pub root_id: i64,
+    pub job_id: i64,
+    pub status: ScanJobStatus,
+    pub scanned_count: i64,
+    pub error_count: i64,
+    pub estimated_total_count: Option<i64>,
+    pub progress_percent: i64,
+    pub current_path: Option<String>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub error_message: Option<String>,
+}
+
+impl ScanStatus {
+    pub(crate) fn from_job(job: ScanJob) -> Self {
+        let progress_percent = match job.estimated_total_count {
+            Some(t) if t > 0 => {
+                let raw = (job.scanned_count.saturating_mul(100)) / t;
+                raw.clamp(0, 100)
+            }
+            _ => 0,
+        };
+        Self {
+            root_id: job.root_id,
+            job_id: job.id,
+            status: job.status,
+            scanned_count: job.scanned_count,
+            error_count: job.error_count,
+            estimated_total_count: job.estimated_total_count,
+            progress_percent,
+            current_path: job.current_path,
+            started_at: job.started_at,
+            finished_at: job.finished_at,
+            error_message: job.error_message,
+        }
+    }
+}
+
 #[tauri::command]
 pub fn get_scan_status(
     state: State<'_, AppState>,
     root_id: i64,
-) -> CommandResult<Option<ScanJob>> {
+) -> CommandResult<Option<ScanStatus>> {
     let conn = lock_conn(&state)?;
-    Ok(db::get_latest_scan_job_for_root(&conn, root_id)?)
+    Ok(db::get_latest_scan_job_for_root(&conn, root_id)?.map(ScanStatus::from_job))
+}
+
+/// Spawn a scan worker for every enabled root that isn't already scanning.
+///
+/// Skips roots where the cancellation registry already has a token (a worker
+/// is in-flight). A single failed `spawn_scan` does not abort the whole
+/// loop. Returns the count of newly-spawned scans.
+#[tauri::command]
+pub fn start_scan_all_roots(state: State<'_, AppState>) -> CommandResult<i64> {
+    scan_all_roots_inner(&state)
+}
+
+pub(crate) fn scan_all_roots_inner(state: &AppState) -> CommandResult<i64> {
+    let roots = {
+        let conn = lock_conn(state)?;
+        db::list_roots(&conn)?
+    };
+
+    // Build a queue of (root, snapshot inputs, cancel token) for every
+    // enabled root that isn't already in flight. Claims happen via
+    // `try_register`, so a parallel `start_scan` from the UI can't race
+    // us onto the same root.
+    //
+    // Why sequential instead of parallel: scanning N roots concurrently
+    // creates an I/O storm on the disk, fights for the mutex, and on a
+    // mixed local+NAS setup the slow NAS scan can starve the fast local
+    // one of writer time. A single worker that processes roots one at a
+    // time gives each scan full bandwidth and produces predictable timing.
+    type QueueItem = (i64, String, RootKind, ScanFilters, std::sync::Arc<std::sync::atomic::AtomicBool>);
+    let mut queue: Vec<QueueItem> = Vec::new();
+    for r in roots.iter().filter(|r| r.enabled) {
+        let cancel = match state.scan_cancellations.try_register(r.id) {
+            Some(t) => t,
+            None => {
+                tracing::info!(root_id = r.id, "auto-scan-all: skip (already running)");
+                continue;
+            }
+        };
+        let filters = {
+            let conn = lock_conn(state)?;
+            let s = settings::load(&conn).unwrap_or_default();
+            ScanFilters {
+                include_files: s.index_files,
+                include_folders: s.index_folders,
+                show_hidden: s.show_hidden_files,
+            }
+        };
+        queue.push((r.id, r.path.clone(), r.kind, filters, cancel));
+    }
+
+    let spawned = queue.len() as i64;
+    if spawned == 0 {
+        tracing::info!(spawned, "start_scan_all_roots completed (nothing to do)");
+        return Ok(spawned);
+    }
+
+    let conn_arc = state.conn.clone();
+    let cancellations = state.scan_cancellations.clone();
+    std::thread::spawn(move || {
+        for (root_id, root_path, source_kind, filters, cancel) in queue {
+            // If the user cancelled this root before we got to it (rare but
+            // possible — they could click Cancel on a queued root), the flag
+            // is already set; the scanner will see it on the very first
+            // walker iteration and return Cancelled cheaply.
+            let result = scanner::scan_cancellable(
+                conn_arc.clone(),
+                ScanInput {
+                    root_id,
+                    root_path,
+                    source_kind,
+                },
+                filters,
+                cancel,
+                |_progress| {},
+            );
+            cancellations.clear(root_id);
+            if let Err(e) = result {
+                tracing::error!(
+                    root_id,
+                    error = %e,
+                    "auto-scan worker: scan failed; continuing with next root",
+                );
+            }
+        }
+        tracing::info!("auto-scan worker: queue drained");
+    });
+
+    tracing::info!(spawned, "start_scan_all_roots queued");
+    Ok(spawned)
 }
 
 #[tauri::command]
@@ -389,19 +532,11 @@ pub fn rebuild_index(state: State<'_, AppState>) -> CommandResult<()> {
             .map_err(|e| CommandError::from(crate::db::DbError::Sqlite(e)))?;
         tracing::warn!(removed = n, "rebuild_index: cleared file rows");
     }
-    let roots = {
-        let conn = lock_conn(&state)?;
-        db::list_roots(&conn)?
-    };
-    let mut spawned = 0;
-    for r in roots.iter().filter(|r| r.enabled) {
-        if let Err(e) = spawn_scan(&state, r.id) {
-            tracing::warn!(root_id = r.id, error = %e, "rebuild_index: failed to spawn scan");
-        } else {
-            spawned += 1;
-        }
-    }
-    tracing::info!(spawned, "rebuild_index: scans spawned");
+    // Reuse the auto-scan queue worker so all roots run sequentially through
+    // the same single thread instead of N parallel threads racing each
+    // other on disk and DB.
+    let spawned = scan_all_roots_inner(&state)?;
+    tracing::info!(spawned, "rebuild_index: scans queued");
     Ok(())
 }
 

@@ -14,8 +14,9 @@ use rusqlite::Connection;
 
 pub use error::{DbError, Result};
 pub use files::{
-    begin_index_transaction, remove_file, search_files, search_files_with_options, upsert_file,
-    upsert_file_in_transaction, SearchOptions, SortBy,
+    begin_index_transaction, load_root_file_index, mark_files_inaccessible, remove_file,
+    search_files, search_files_with_options, upsert_file, upsert_file_in_transaction,
+    FileSnapshot, SearchOptions, SortBy,
 };
 pub use model::{
     EnumParseError, FileHit, FileMetadata, Root, RootKind, RootStatus, ScanJob, ScanJobStatus,
@@ -26,7 +27,7 @@ pub use roots::{
 };
 pub use scan_jobs::{
     create_scan_job, finish_scan_job, get_latest_scan_job_for_root, get_scan_job,
-    update_scan_job_progress,
+    update_scan_job_estimated_total, update_scan_job_progress,
 };
 
 pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
@@ -44,7 +45,23 @@ pub fn init_in_memory_db() -> Result<Connection> {
 }
 
 fn configure(conn: &Connection) -> Result<()> {
-    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    // Tuning rationale:
+    // - `journal_mode = WAL`: lets concurrent reads (search, list_roots,
+    //   get_scan_status) run while a scan worker is writing. On `:memory:`
+    //   databases this is silently a no-op which is fine for tests.
+    // - `synchronous = NORMAL`: WAL with NORMAL is durable on commit + fast.
+    //   FULL is overkill for an indexer that always recovers from a rescan.
+    // - `temp_store = MEMORY`: keeps SQLite's intermediate sorts/indexes off
+    //   disk; meaningful win when FTS5 builds large posting lists.
+    // - `cache_size = -65536`: 64 MB page cache (negative = KB). Plenty for
+    //   our datasets and small enough to not pressure the system.
+    conn.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA temp_store = MEMORY;
+         PRAGMA cache_size = -65536;",
+    )?;
     Ok(())
 }
 
@@ -294,7 +311,7 @@ mod tests {
         assert_eq!(initial.error_count, 0);
         assert!(initial.finished_at.is_none());
 
-        update_scan_job_progress(&conn, job_id, 100, 2).unwrap();
+        update_scan_job_progress(&conn, job_id, 100, 2, None).unwrap();
         let mid = get_scan_job(&conn, job_id).unwrap();
         assert_eq!(mid.scanned_count, 100);
         assert_eq!(mid.error_count, 2);
