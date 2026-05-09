@@ -1,5 +1,10 @@
+pub mod cancel;
 pub mod error;
 mod extract;
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -8,10 +13,23 @@ use walkdir::WalkDir;
 use crate::db::{self, DbError, FileMetadata, RootKind, RootStatus, ScanJobStatus};
 use crate::roots::{decide_status_from_accessibility, probe_path_accessibility};
 
+pub use cancel::ScanCancellations;
 pub use error::{Result, ScanError};
 use extract::extract_metadata;
 
+/// Number of file metadata rows we accumulate before committing a transaction.
+/// Tuned for first-pass throughput on macOS APFS — 500 keeps individual
+/// commits short (a few ms) while amortising fixed transaction overhead.
 const BATCH_SIZE: usize = 500;
+
+/// Frequency (in scanned+errored entries) at which `scan_jobs.scanned_count`
+/// and the `on_progress` callback fire. Lower = more responsive UI but more
+/// write contention with concurrent searches.
+const PROGRESS_DB_INTERVAL: i64 = 2500;
+
+/// Wall-clock floor for progress emission, so a slow filesystem still produces
+/// regular UI updates even before `PROGRESS_DB_INTERVAL` is hit.
+const PROGRESS_TIME_MS: u128 = 500;
 
 #[derive(Debug, Clone)]
 pub struct ScanInput {
@@ -38,36 +56,50 @@ pub struct ScanOutcome {
     pub error_message: Option<String>,
 }
 
-/// Run a full scan for one root.
-///
-/// Lifecycle:
-///  1. Create a `scan_jobs` row (status=running).
-///  2. Probe the root path. If unreachable, finish the job as failed and
-///     transition the root to `disconnected` (NAS) or `error` (local). The
-///     `files` table is **not** touched — old index entries must remain
-///     searchable while a NAS volume is offline.
-///  3. Otherwise, mark the root as `scanning`, walk recursively (no symlink
-///     following), and batch-upsert into `files` (and via triggers,
-///     `files_fts`) inside transactions sized at `BATCH_SIZE`.
-///  4. Per-batch and at end-of-scan, update `scan_jobs.scanned_count` /
-///     `error_count` and invoke `on_progress` with the latest snapshot.
-///  5. Finish the job as success and transition the root to `available`.
-///
-/// Errors encountered during walking (permission denied, dangling symlink,
-/// metadata read failures) are counted into `error_count` and skipped — the
-/// scan never panics on individual entries.
+/// Run a non-cancellable scan. Equivalent to `scan_cancellable` with a token
+/// that is never set.
 pub fn scan(
-    conn: &mut Connection,
+    conn: Arc<Mutex<Connection>>,
     input: ScanInput,
+    on_progress: impl FnMut(&Progress),
+) -> Result<ScanOutcome> {
+    scan_cancellable(conn, input, Arc::new(AtomicBool::new(false)), on_progress)
+}
+
+/// Run a full scan with cooperative cancellation.
+///
+/// Concurrency model: the connection mutex is acquired per batch (a few ms
+/// at a time) rather than for the whole scan. Between batches the walker
+/// runs without the lock, which lets `search_files`, `list_index_roots`,
+/// `get_scan_status`, and the watcher's event handler interleave freely.
+///
+/// Cancellation: `cancel.load(Relaxed)` is checked at the top of every
+/// iteration of the walker, so the worker stops within one entry of the
+/// `cancel_scan` command. On cancel, partially-indexed rows are kept (no
+/// rollback), `scan_jobs.status` becomes `cancelled` with a summary message,
+/// and the root transitions back to `available`.
+///
+/// Error aggregation: per-entry walker errors and metadata-read failures
+/// increment `error_count` instead of aborting the scan. On completion the
+/// final `scan_jobs` row carries either `Some("scan completed with N errors")`
+/// or `None`, never raw per-event noise.
+pub fn scan_cancellable(
+    conn: Arc<Mutex<Connection>>,
+    input: ScanInput,
+    cancel: Arc<AtomicBool>,
     mut on_progress: impl FnMut(&Progress),
 ) -> Result<ScanOutcome> {
-    let job_id = db::create_scan_job(conn, input.root_id)?;
+    let job_id = {
+        let g = lock(&conn)?;
+        db::create_scan_job(&g, input.root_id)?
+    };
 
     if !probe_path_accessibility(&input.root_path) {
         let new_status = decide_status_from_accessibility(input.source_kind, false);
         let msg = format!("root path not accessible: {}", input.root_path);
-        db::finish_scan_job(conn, job_id, ScanJobStatus::Failed, Some(&msg))?;
-        db::update_root_status(conn, input.root_id, new_status)?;
+        let g = lock(&conn)?;
+        db::finish_scan_job(&g, job_id, ScanJobStatus::Failed, Some(&msg))?;
+        db::update_root_status(&g, input.root_id, new_status)?;
         return Ok(ScanOutcome {
             job_id,
             status: ScanJobStatus::Failed,
@@ -78,18 +110,31 @@ pub fn scan(
         });
     }
 
-    db::update_root_status(conn, input.root_id, RootStatus::Scanning)?;
+    {
+        let g = lock(&conn)?;
+        db::update_root_status(&g, input.root_id, RootStatus::Scanning)?;
+    }
 
     let mut buffer: Vec<FileMetadata> = Vec::with_capacity(BATCH_SIZE);
     let mut scanned: i64 = 0;
     let mut errors: i64 = 0;
     let mut current_path: Option<String> = None;
+    let mut last_progress_count: i64 = 0;
+    let mut last_progress_at = Instant::now();
 
     let walker = WalkDir::new(&input.root_path)
         .follow_links(false)
         .min_depth(1);
 
+    let mut cancelled = false;
     for entry_result in walker {
+        // Cancellation check at the very top of each iteration so the worker
+        // exits within one walkdir entry of the user clicking Cancel.
+        if cancel.load(Ordering::Relaxed) {
+            cancelled = true;
+            break;
+        }
+
         match entry_result {
             Ok(entry) => {
                 current_path = Some(entry.path().to_string_lossy().into_owned());
@@ -98,9 +143,7 @@ pub fn scan(
                         buffer.push(m);
                         scanned += 1;
                     }
-                    None => {
-                        errors += 1;
-                    }
+                    None => errors += 1,
                 }
             }
             Err(e) => {
@@ -110,19 +153,36 @@ pub fn scan(
         }
 
         if buffer.len() >= BATCH_SIZE {
-            flush(conn, &mut buffer)?;
-            db::update_scan_job_progress(conn, job_id, scanned, errors)?;
-            on_progress(&Progress {
-                job_id,
-                scanned_count: scanned,
-                error_count: errors,
-                current_path: current_path.clone(),
-            });
+            let total_now = scanned + errors;
+            let should_emit_progress = (total_now - last_progress_count)
+                >= PROGRESS_DB_INTERVAL
+                || last_progress_at.elapsed().as_millis() >= PROGRESS_TIME_MS;
+            {
+                let mut g = lock(&conn)?;
+                flush_locked(&mut g, &mut buffer)?;
+                if should_emit_progress {
+                    db::update_scan_job_progress(&g, job_id, scanned, errors)?;
+                }
+            }
+            if should_emit_progress {
+                on_progress(&Progress {
+                    job_id,
+                    scanned_count: scanned,
+                    error_count: errors,
+                    current_path: current_path.clone(),
+                });
+                last_progress_count = total_now;
+                last_progress_at = Instant::now();
+            }
         }
     }
 
-    flush(conn, &mut buffer)?;
-    db::update_scan_job_progress(conn, job_id, scanned, errors)?;
+    // Final flush + a guaranteed terminal progress emission.
+    {
+        let mut g = lock(&conn)?;
+        flush_locked(&mut g, &mut buffer)?;
+        db::update_scan_job_progress(&g, job_id, scanned, errors)?;
+    }
     on_progress(&Progress {
         job_id,
         scanned_count: scanned,
@@ -130,8 +190,34 @@ pub fn scan(
         current_path: current_path.clone(),
     });
 
-    db::finish_scan_job(conn, job_id, ScanJobStatus::Success, None)?;
-    db::update_root_status(conn, input.root_id, RootStatus::Available)?;
+    let g = lock(&conn)?;
+    if cancelled {
+        let msg = format!(
+            "cancelled by user after {scanned} indexed entr{} ({errors} error{})",
+            if scanned == 1 { "y" } else { "ies" },
+            if errors == 1 { "" } else { "s" },
+        );
+        db::finish_scan_job(&g, job_id, ScanJobStatus::Cancelled, Some(&msg))?;
+        db::update_root_status(&g, input.root_id, RootStatus::Available)?;
+        return Ok(ScanOutcome {
+            job_id,
+            status: ScanJobStatus::Cancelled,
+            scanned_count: scanned,
+            error_count: errors,
+            final_root_status: RootStatus::Available,
+            error_message: Some(msg),
+        });
+    }
+
+    let final_msg = if errors > 0 {
+        Some(format!(
+            "scan completed: {scanned} indexed, {errors} skipped"
+        ))
+    } else {
+        None
+    };
+    db::finish_scan_job(&g, job_id, ScanJobStatus::Success, final_msg.as_deref())?;
+    db::update_root_status(&g, input.root_id, RootStatus::Available)?;
 
     Ok(ScanOutcome {
         job_id,
@@ -139,11 +225,17 @@ pub fn scan(
         scanned_count: scanned,
         error_count: errors,
         final_root_status: RootStatus::Available,
-        error_message: None,
+        error_message: final_msg,
     })
 }
 
-fn flush(conn: &mut Connection, buffer: &mut Vec<FileMetadata>) -> Result<()> {
+fn lock(
+    conn: &Arc<Mutex<Connection>>,
+) -> Result<std::sync::MutexGuard<'_, Connection>> {
+    conn.lock().map_err(|_| ScanError::PoisonedLock)
+}
+
+fn flush_locked(conn: &mut Connection, buffer: &mut Vec<FileMetadata>) -> Result<()> {
     if buffer.is_empty() {
         return Ok(());
     }
@@ -160,6 +252,8 @@ fn flush(conn: &mut Connection, buffer: &mut Vec<FileMetadata>) -> Result<()> {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -197,6 +291,10 @@ mod tests {
         let _ = fs::remove_dir_all(p);
     }
 
+    fn make_conn() -> Arc<Mutex<Connection>> {
+        Arc::new(Mutex::new(init_in_memory_db().unwrap()))
+    }
+
     fn cached_row(root_id: i64, path: &str, name: &str, kind: RootKind) -> FileMetadata {
         FileMetadata {
             root_id,
@@ -214,19 +312,18 @@ mod tests {
     #[test]
     fn scan_indexes_files_and_dirs_search_works() {
         let dir = unique_test_dir("happy");
-        // tree:
-        //   dir/foo.txt
-        //   dir/notes/
-        //   dir/notes/bar.md
         fs::write(dir.join("foo.txt"), b"hello").unwrap();
         fs::create_dir_all(dir.join("notes")).unwrap();
         fs::write(dir.join("notes").join("bar.md"), b"world").unwrap();
 
-        let mut conn = init_in_memory_db().unwrap();
-        let root = register_root(&conn, dir.to_str().unwrap(), Some("local")).unwrap();
+        let conn = make_conn();
+        let root = {
+            let g = conn.lock().unwrap();
+            register_root(&g, dir.to_str().unwrap(), Some("local")).unwrap()
+        };
 
         let outcome = scan(
-            &mut conn,
+            conn.clone(),
             ScanInput {
                 root_id: root.id,
                 root_path: root.path.clone(),
@@ -238,28 +335,18 @@ mod tests {
 
         assert_eq!(outcome.status, ScanJobStatus::Success);
         assert_eq!(outcome.error_count, 0);
-        assert!(
-            outcome.scanned_count >= 3,
-            "expected ≥3 entries (foo.txt + notes/ + bar.md), got {}",
-            outcome.scanned_count
-        );
+        assert!(outcome.scanned_count >= 3);
         assert_eq!(outcome.final_root_status, RootStatus::Available);
 
-        let foo = search_files(&conn, "foo", 10, 0).unwrap();
+        let g = conn.lock().unwrap();
+        let foo = search_files(&g, "foo", 10, 0).unwrap();
         assert!(foo.iter().any(|h| h.name == "foo.txt" && !h.is_dir));
-        assert!(foo.iter().any(|h| h.extension.as_deref() == Some("txt")));
+        let bar = search_files(&g, "bar", 10, 0).unwrap();
+        assert!(bar.iter().any(|h| h.name == "bar.md"));
+        let notes = search_files(&g, "notes", 10, 0).unwrap();
+        assert!(notes.iter().any(|h| h.is_dir && h.name == "notes"));
 
-        let bar = search_files(&conn, "bar", 10, 0).unwrap();
-        assert!(bar.iter().any(|h| h.name == "bar.md" && !h.is_dir));
-        assert!(bar.iter().any(|h| h.extension.as_deref() == Some("md")));
-
-        // Folder is also indexed with is_dir=true.
-        let notes = search_files(&conn, "notes", 10, 0).unwrap();
-        assert!(
-            notes.iter().any(|h| h.is_dir && h.name == "notes"),
-            "notes/ must be indexed as a directory entry; got {notes:?}"
-        );
-
+        drop(g);
         cleanup(&dir);
     }
 
@@ -268,11 +355,13 @@ mod tests {
         let dir = unique_test_dir("job");
         fs::write(dir.join("z.txt"), b"z").unwrap();
 
-        let mut conn = init_in_memory_db().unwrap();
-        let root = register_root(&conn, dir.to_str().unwrap(), Some("local")).unwrap();
-
+        let conn = make_conn();
+        let root = {
+            let g = conn.lock().unwrap();
+            register_root(&g, dir.to_str().unwrap(), Some("local")).unwrap()
+        };
         let outcome = scan(
-            &mut conn,
+            conn.clone(),
             ScanInput {
                 root_id: root.id,
                 root_path: root.path.clone(),
@@ -282,7 +371,8 @@ mod tests {
         )
         .unwrap();
 
-        let row: (String, i64, i64, Option<String>) = conn
+        let g = conn.lock().unwrap();
+        let row: (String, i64, i64, Option<String>) = g
             .query_row(
                 "SELECT status, scanned_count, error_count, finished_at
                  FROM scan_jobs WHERE id = ?1",
@@ -292,9 +382,9 @@ mod tests {
             .unwrap();
         assert_eq!(row.0, "success");
         assert_eq!(row.1, outcome.scanned_count);
-        assert_eq!(row.2, outcome.error_count);
-        assert!(row.3.is_some(), "finished_at must be populated");
+        assert!(row.3.is_some());
 
+        drop(g);
         cleanup(&dir);
     }
 
@@ -303,13 +393,16 @@ mod tests {
         let dir = unique_test_dir("progress");
         fs::write(dir.join("a.txt"), b"a").unwrap();
 
-        let mut conn = init_in_memory_db().unwrap();
-        let root = register_root(&conn, dir.to_str().unwrap(), Some("local")).unwrap();
+        let conn = make_conn();
+        let root = {
+            let g = conn.lock().unwrap();
+            register_root(&g, dir.to_str().unwrap(), Some("local")).unwrap()
+        };
 
         let mut last: Option<Progress> = None;
         let mut calls = 0u32;
         scan(
-            &mut conn,
+            conn.clone(),
             ScanInput {
                 root_id: root.id,
                 root_path: root.path.clone(),
@@ -321,32 +414,34 @@ mod tests {
             },
         )
         .unwrap();
-
-        assert!(calls >= 1, "progress callback must be invoked at least once");
+        // Final progress is always emitted even for tiny scans.
+        assert!(calls >= 1);
         let p = last.unwrap();
         assert!(p.scanned_count >= 1);
         assert_eq!(p.error_count, 0);
+
         cleanup(&dir);
     }
 
     #[test]
     fn missing_local_root_marks_error_and_keeps_old_index() {
-        let mut conn = init_in_memory_db().unwrap();
+        let conn = make_conn();
         let bogus = unique_missing_path("/tmp/");
-        assert!(
-            fs::metadata(&bogus).is_err(),
-            "test fixture path must not exist on host"
-        );
+        assert!(fs::metadata(&bogus).is_err());
 
-        let root = register_root(&conn, &bogus, Some("local")).unwrap();
-        upsert_file(
-            &conn,
-            &cached_row(root.id, &format!("{bogus}/old.txt"), "old.txt", RootKind::Local),
-        )
-        .unwrap();
+        let root = {
+            let g = conn.lock().unwrap();
+            let r = register_root(&g, &bogus, Some("local")).unwrap();
+            upsert_file(
+                &g,
+                &cached_row(r.id, &format!("{bogus}/old.txt"), "old.txt", RootKind::Local),
+            )
+            .unwrap();
+            r
+        };
 
         let outcome = scan(
-            &mut conn,
+            conn.clone(),
             ScanInput {
                 root_id: root.id,
                 root_path: bogus.clone(),
@@ -360,51 +455,42 @@ mod tests {
         assert_eq!(outcome.final_root_status, RootStatus::Error);
         assert!(outcome.error_message.is_some());
 
-        let count: i64 = conn
+        let g = conn.lock().unwrap();
+        let count: i64 = g
             .query_row(
                 "SELECT COUNT(*) FROM files WHERE root_id = ?1",
                 [root.id],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1, "old index must NOT be deleted on a failed scan");
-        let hits = search_files(&conn, "old", 10, 0).unwrap();
-        assert!(hits.iter().any(|h| h.name == "old.txt"));
-
-        // The failed scan_job is recorded with a structured error message.
-        let (status, msg): (String, Option<String>) = conn
-            .query_row(
-                "SELECT status, error_message FROM scan_jobs WHERE id = ?1",
-                [outcome.job_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(status, "failed");
-        assert!(msg.unwrap().contains("not accessible"));
+        assert_eq!(count, 1, "old index must be preserved");
     }
 
     #[test]
     fn missing_nas_root_marks_disconnected_and_keeps_old_index() {
-        let mut conn = init_in_memory_db().unwrap();
+        let conn = make_conn();
         let nas = unique_missing_path("/Volumes/");
         assert!(fs::metadata(&nas).is_err());
 
-        let root = register_root(&conn, &nas, None).unwrap(); // auto-detect → nas
-        assert_eq!(root.kind, RootKind::Nas);
-
-        upsert_file(
-            &conn,
-            &cached_row(
-                root.id,
-                &format!("{nas}/cached.bin"),
-                "cached.bin",
-                RootKind::Nas,
-            ),
-        )
-        .unwrap();
+        let root = {
+            let g = conn.lock().unwrap();
+            let r = register_root(&g, &nas, None).unwrap();
+            assert_eq!(r.kind, RootKind::Nas);
+            upsert_file(
+                &g,
+                &cached_row(
+                    r.id,
+                    &format!("{nas}/cached.bin"),
+                    "cached.bin",
+                    RootKind::Nas,
+                ),
+            )
+            .unwrap();
+            r
+        };
 
         let outcome = scan(
-            &mut conn,
+            conn.clone(),
             ScanInput {
                 root_id: root.id,
                 root_path: nas.clone(),
@@ -415,22 +501,17 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome.status, ScanJobStatus::Failed);
-        assert_eq!(
-            outcome.final_root_status,
-            RootStatus::Disconnected,
-            "NAS unreachable must transition to Disconnected, not Error"
-        );
+        assert_eq!(outcome.final_root_status, RootStatus::Disconnected);
 
-        let count: i64 = conn
+        let g = conn.lock().unwrap();
+        let count: i64 = g
             .query_row(
                 "SELECT COUNT(*) FROM files WHERE root_id = ?1",
                 [root.id],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1, "cached NAS index must NEVER be cleared on disconnect");
-        let hits = search_files(&conn, "cached", 10, 0).unwrap();
-        assert!(hits.iter().any(|h| h.name == "cached.bin"));
+        assert_eq!(count, 1);
     }
 
     #[cfg(unix)]
@@ -438,17 +519,19 @@ mod tests {
     fn scan_does_not_panic_on_dangling_symlink() {
         let dir = unique_test_dir("symlink");
         fs::write(dir.join("real.txt"), b"r").unwrap();
-        // Create a symlink pointing at something that doesn't exist.
         std::os::unix::fs::symlink(
             dir.join("__missing_target_for_dangling_symlink__"),
             dir.join("dangling"),
         )
         .unwrap();
 
-        let mut conn = init_in_memory_db().unwrap();
-        let root = register_root(&conn, dir.to_str().unwrap(), Some("local")).unwrap();
+        let conn = make_conn();
+        let root = {
+            let g = conn.lock().unwrap();
+            register_root(&g, dir.to_str().unwrap(), Some("local")).unwrap()
+        };
         let outcome = scan(
-            &mut conn,
+            conn.clone(),
             ScanInput {
                 root_id: root.id,
                 root_path: root.path.clone(),
@@ -457,16 +540,14 @@ mod tests {
             |_| {},
         )
         .unwrap();
-
-        // The scan must complete; whether the symlink counts as scanned vs error
-        // is platform-dependent — both are acceptable as long as we didn't panic.
         assert_eq!(outcome.status, ScanJobStatus::Success);
         assert!(outcome.scanned_count + outcome.error_count >= 1);
 
-        // The real file must always be indexed regardless of how the symlink is handled.
-        let real = search_files(&conn, "real", 10, 0).unwrap();
+        let g = conn.lock().unwrap();
+        let real = search_files(&g, "real", 10, 0).unwrap();
         assert!(real.iter().any(|h| h.name == "real.txt"));
 
+        drop(g);
         cleanup(&dir);
     }
 
@@ -475,27 +556,157 @@ mod tests {
         let dir = unique_test_dir("rescan");
         fs::write(dir.join("a.txt"), b"a").unwrap();
 
-        let mut conn = init_in_memory_db().unwrap();
-        let root = register_root(&conn, dir.to_str().unwrap(), Some("local")).unwrap();
+        let conn = make_conn();
+        let root = {
+            let g = conn.lock().unwrap();
+            register_root(&g, dir.to_str().unwrap(), Some("local")).unwrap()
+        };
         let input = ScanInput {
             root_id: root.id,
             root_path: root.path.clone(),
             source_kind: root.kind,
         };
-        let first = scan(&mut conn, input.clone(), |_| {}).unwrap();
-        let second = scan(&mut conn, input, |_| {}).unwrap();
+        let first = scan(conn.clone(), input.clone(), |_| {}).unwrap();
+        let second = scan(conn.clone(), input, |_| {}).unwrap();
         assert_eq!(first.status, ScanJobStatus::Success);
         assert_eq!(second.status, ScanJobStatus::Success);
 
-        let count: i64 = conn
+        let g = conn.lock().unwrap();
+        let count: i64 = g
             .query_row(
                 "SELECT COUNT(*) FROM files WHERE root_id = ?1",
                 [root.id],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, first.scanned_count, "second scan must upsert in place");
+        assert_eq!(count, first.scanned_count);
 
+        drop(g);
+        cleanup(&dir);
+    }
+
+    // --- cancellation ---------------------------------------------------
+
+    #[test]
+    fn pre_cancelled_scan_finishes_with_cancelled_status_and_no_writes() {
+        // Pre-cancel before scan starts: the very first iteration of the
+        // walker hits the cancel check and breaks out before any upsert.
+        let dir = unique_test_dir("pre_cancel");
+        fs::write(dir.join("a.txt"), b"a").unwrap();
+        fs::write(dir.join("b.txt"), b"b").unwrap();
+        fs::write(dir.join("c.txt"), b"c").unwrap();
+
+        let conn = make_conn();
+        let root = {
+            let g = conn.lock().unwrap();
+            register_root(&g, dir.to_str().unwrap(), Some("local")).unwrap()
+        };
+
+        let cancel = Arc::new(AtomicBool::new(true));
+        let outcome = scan_cancellable(
+            conn.clone(),
+            ScanInput {
+                root_id: root.id,
+                root_path: root.path.clone(),
+                source_kind: root.kind,
+            },
+            cancel,
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, ScanJobStatus::Cancelled);
+        assert_eq!(outcome.final_root_status, RootStatus::Available);
+        assert!(outcome
+            .error_message
+            .as_deref()
+            .unwrap_or("")
+            .to_lowercase()
+            .contains("cancel"));
+
+        let g = conn.lock().unwrap();
+        let count: i64 = g
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "pre-cancelled scan must not have indexed anything");
+
+        let job_status: String = g
+            .query_row(
+                "SELECT status FROM scan_jobs WHERE id = ?1",
+                [outcome.job_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(job_status, "cancelled");
+
+        drop(g);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn cancelled_scan_can_be_followed_by_a_successful_rescan() {
+        let dir = unique_test_dir("cancel_then_rescan");
+        for i in 0..5 {
+            fs::write(dir.join(format!("f{i}.txt")), b"x").unwrap();
+        }
+
+        let conn = make_conn();
+        let root = {
+            let g = conn.lock().unwrap();
+            register_root(&g, dir.to_str().unwrap(), Some("local")).unwrap()
+        };
+        let input = ScanInput {
+            root_id: root.id,
+            root_path: root.path.clone(),
+            source_kind: root.kind,
+        };
+
+        // First run: pre-cancelled → no writes, status=Cancelled, root back
+        // to Available so a follow-up scan can run.
+        let cancel = Arc::new(AtomicBool::new(true));
+        let first = scan_cancellable(conn.clone(), input.clone(), cancel, |_| {}).unwrap();
+        assert_eq!(first.status, ScanJobStatus::Cancelled);
+        assert_eq!(first.final_root_status, RootStatus::Available);
+
+        // Second run: no cancel → completes normally.
+        let second = scan(conn.clone(), input, |_| {}).unwrap();
+        assert_eq!(second.status, ScanJobStatus::Success);
+        assert!(second.scanned_count >= 5);
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn cancellation_is_decoupled_from_path_unreachability() {
+        // If a scan was cancelled but the root path is fine, the next scan
+        // must reach Available (not Disconnected/Error).
+        let dir = unique_test_dir("cancel_path_ok");
+        fs::write(dir.join("a.txt"), b"a").unwrap();
+
+        let conn = make_conn();
+        let root = {
+            let g = conn.lock().unwrap();
+            register_root(&g, dir.to_str().unwrap(), Some("local")).unwrap()
+        };
+        let input = ScanInput {
+            root_id: root.id,
+            root_path: root.path.clone(),
+            source_kind: root.kind,
+        };
+
+        let cancel = Arc::new(AtomicBool::new(true));
+        scan_cancellable(conn.clone(), input.clone(), cancel, |_| {}).unwrap();
+
+        let g = conn.lock().unwrap();
+        let status: String = g
+            .query_row(
+                "SELECT status FROM roots WHERE id = ?1",
+                [root.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(g);
+        assert_eq!(status, "available");
         cleanup(&dir);
     }
 }

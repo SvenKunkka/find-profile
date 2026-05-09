@@ -41,6 +41,7 @@ pub fn run() {
             commands::reveal_in_finder,
             commands::remove_index_root,
             commands::rescan_root,
+            commands::cancel_scan,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

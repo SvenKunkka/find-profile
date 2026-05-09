@@ -251,6 +251,16 @@ function App() {
     }
   }
 
+  async function handleCancel(rootId: number) {
+    setError(null);
+    try {
+      await invoke<boolean>("cancel_scan", { rootId });
+    } catch (e) {
+      console.error("cancel_scan failed", e);
+      setError(`Failed to cancel scan: ${formatError(e)}`);
+    }
+  }
+
   async function handleScan(rootId: number) {
     setError(null);
     try {
@@ -364,14 +374,19 @@ function App() {
                     </span>
                     <button
                       type="button"
-                      className="btn-scan"
+                      className={`btn-scan ${
+                        r.status === "scanning" ? "btn-scan-cancel" : ""
+                      }`}
                       onClick={(e) => {
                         e.stopPropagation();
-                        void handleScan(r.id);
+                        if (r.status === "scanning") {
+                          void handleCancel(r.id);
+                        } else {
+                          void handleScan(r.id);
+                        }
                       }}
-                      disabled={r.status === "scanning"}
                     >
-                      {r.status === "scanning" ? "Scanning…" : "Scan"}
+                      {r.status === "scanning" ? "Cancel" : "Scan"}
                     </button>
                   </div>
                 </li>

@@ -175,6 +175,16 @@ body {
   cursor: not-allowed;
 }
 
+.btn-scan-cancel {
+  border-color: #d97a7a;
+  color: #a31515;
+}
+
+.btn-scan-cancel:hover {
+  background: #fbeaea;
+  border-color: #a31515;
+}
+
 /* ---------- roots list ---------- */
 
 .roots-list {
@@ -672,6 +682,14 @@ body {
   }
   .empty-help strong {
     color: #f2f2f7;
+  }
+  .btn-scan-cancel {
+    border-color: #6a2c2c;
+    color: #ff9b9b;
+  }
+  .btn-scan-cancel:hover {
+    background: #3a1f1f;
+    border-color: #ff9b9b;
   }
   .roots-hints {
     background: #2c2c2e;

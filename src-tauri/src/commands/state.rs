@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
 
+use crate::scanner::ScanCancellations;
 use crate::watcher::WatcherRegistry;
 
 /// Tauri-managed application state.
@@ -20,6 +21,7 @@ use crate::watcher::WatcherRegistry;
 pub struct AppState {
     pub conn: Arc<Mutex<Connection>>,
     pub watchers: Arc<WatcherRegistry>,
+    pub scan_cancellations: Arc<ScanCancellations>,
 }
 
 impl AppState {
@@ -27,6 +29,7 @@ impl AppState {
         Self {
             conn: Arc::new(Mutex::new(conn)),
             watchers: Arc::new(WatcherRegistry::new()),
+            scan_cancellations: Arc::new(ScanCancellations::new()),
         }
     }
 }

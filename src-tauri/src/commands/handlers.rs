@@ -8,6 +8,7 @@ use tauri::State;
 use crate::db::{self, FileHit, Root, RootKind, RootStatus, ScanJob, SearchOptions, SortBy};
 use crate::roots::register_root;
 use crate::scanner::{self, ScanInput};
+use std::sync::Arc;
 
 use super::error::{CommandError, CommandResult};
 use super::state::AppState;
@@ -76,33 +77,45 @@ fn spawn_scan(state: &AppState, root_id: i64) -> CommandResult<()> {
         (root.path, root.kind)
     };
 
-    let conn_arc = state.conn.clone();
+    // Register a fresh cancellation token for this scan. `cancel_scan` flips
+    // it; the worker polls it at every walker iteration.
+    let cancel = state.scan_cancellations.register(root_id);
+    let conn_arc: Arc<_> = state.conn.clone();
+    let cancellations = state.scan_cancellations.clone();
+
     std::thread::spawn(move || {
-        // Acquire the lock inside the worker; failures are recorded into
-        // scan_jobs by scanner::scan itself, so we don't need to surface
-        // anything back from this thread.
-        let Ok(mut guard) = conn_arc.lock() else {
-            eprintln!("scan worker: db mutex poisoned for root {root_id}");
-            return;
-        };
-        let result = scanner::scan(
-            &mut guard,
+        let result = scanner::scan_cancellable(
+            conn_arc,
             ScanInput {
                 root_id,
                 root_path,
                 source_kind,
             },
+            cancel,
             |_progress| {
                 // TODO(next stage): emit `scan-progress` Tauri events. For
                 // now the frontend polls get_scan_status.
             },
         );
+        // Always clear the token so a follow-up Scan can register a fresh one.
+        cancellations.clear(root_id);
         if let Err(e) = result {
             eprintln!("scan worker for root {root_id} failed: {e}");
         }
     });
 
     Ok(())
+}
+
+/// Signal cooperative cancellation for an in-flight scan.
+///
+/// Returns `true` when a running scan token was found and flipped, `false`
+/// when no scan is currently tracked for this root (either it never started
+/// or it already finished). Either way the call is safe — it never races a
+/// destructive DB operation.
+#[tauri::command]
+pub fn cancel_scan(state: State<'_, AppState>, root_id: i64) -> CommandResult<bool> {
+    Ok(state.scan_cancellations.cancel(root_id))
 }
 
 #[tauri::command]

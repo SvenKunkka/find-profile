@@ -6,6 +6,9 @@ use crate::db::DbError;
 pub enum ScanError {
     #[error(transparent)]
     Db(#[from] DbError),
+
+    #[error("scan database mutex poisoned")]
+    PoisonedLock,
 }
 
 pub type Result<T> = std::result::Result<T, ScanError>;
