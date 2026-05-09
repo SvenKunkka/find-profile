@@ -17,8 +17,11 @@ pub use files::{
 pub use model::{
     EnumParseError, FileHit, FileMetadata, Root, RootKind, RootStatus, ScanJob, ScanJobStatus,
 };
-pub use roots::{add_root, get_root, list_roots, update_root_status};
-pub use scan_jobs::{create_scan_job, finish_scan_job, get_scan_job, update_scan_job_progress};
+pub use roots::{add_root, delete_root, disable_root, get_root, list_roots, update_root_status};
+pub use scan_jobs::{
+    create_scan_job, finish_scan_job, get_latest_scan_job_for_root, get_scan_job,
+    update_scan_job_progress,
+};
 
 pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
     let conn = Connection::open(path.as_ref())?;
@@ -344,6 +347,96 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn disable_root_flips_enabled_flag_without_touching_files() {
+        let conn = init_in_memory_db().unwrap();
+        let r = add_root(&conn, "/a", RootKind::Local).unwrap();
+        upsert_file(&conn, &meta(r.id, "/a/keep.txt", "keep.txt")).unwrap();
+
+        disable_root(&conn, r.id).unwrap();
+
+        let after = get_root(&conn, r.id).unwrap();
+        assert!(!after.enabled, "disable should set enabled=0");
+
+        // Files for the disabled root must remain — index is preserved.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE root_id = ?1",
+                [r.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "disable_root must NOT delete files");
+    }
+
+    #[test]
+    fn disable_root_unknown_id_returns_not_found() {
+        let conn = init_in_memory_db().unwrap();
+        let err = disable_root(&conn, 9999).unwrap_err();
+        assert!(matches!(err, DbError::NotFound(_)));
+    }
+
+    #[test]
+    fn delete_root_cascades_to_files_and_scan_jobs() {
+        let conn = init_in_memory_db().unwrap();
+        let r = add_root(&conn, "/a", RootKind::Local).unwrap();
+        upsert_file(&conn, &meta(r.id, "/a/x.txt", "x.txt")).unwrap();
+        let job_id = create_scan_job(&conn, r.id).unwrap();
+        finish_scan_job(&conn, job_id, ScanJobStatus::Success, None).unwrap();
+
+        delete_root(&conn, r.id).unwrap();
+
+        let roots_left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM roots WHERE id = ?1", [r.id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(roots_left, 0);
+
+        let files_left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE root_id = ?1",
+                [r.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(files_left, 0, "FK cascade must remove files");
+
+        let jobs_left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM scan_jobs WHERE root_id = ?1",
+                [r.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(jobs_left, 0, "FK cascade must remove scan_jobs");
+
+        // FTS must also be cleaned up via the AFTER DELETE trigger on files.
+        assert!(search_files(&conn, "x", 10, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_root_unknown_id_returns_not_found() {
+        let conn = init_in_memory_db().unwrap();
+        let err = delete_root(&conn, 9999).unwrap_err();
+        assert!(matches!(err, DbError::NotFound(_)));
+    }
+
+    #[test]
+    fn get_latest_scan_job_for_root_returns_most_recent_or_none() {
+        let conn = init_in_memory_db().unwrap();
+        let r = add_root(&conn, "/a", RootKind::Local).unwrap();
+        assert!(get_latest_scan_job_for_root(&conn, r.id).unwrap().is_none());
+
+        let j1 = create_scan_job(&conn, r.id).unwrap();
+        finish_scan_job(&conn, j1, ScanJobStatus::Success, None).unwrap();
+        let j2 = create_scan_job(&conn, r.id).unwrap();
+
+        let latest = get_latest_scan_job_for_root(&conn, r.id).unwrap().unwrap();
+        assert_eq!(latest.id, j2);
+        assert_eq!(latest.status, ScanJobStatus::Running);
     }
 
     #[test]

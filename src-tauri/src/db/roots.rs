@@ -62,3 +62,28 @@ pub fn list_roots(conn: &Connection) -> Result<Vec<Root>> {
     }
     Ok(out)
 }
+
+/// Soft-remove a root by flipping its `enabled` flag to 0.
+/// The `files` and `scan_jobs` rows for this root are preserved untouched —
+/// the index remains queryable even though the root is no longer active.
+pub fn disable_root(conn: &Connection, root_id: i64) -> Result<()> {
+    let now = now_iso();
+    let n = conn.execute(
+        "UPDATE roots SET enabled = 0, updated_at = ?1 WHERE id = ?2",
+        params![now, root_id],
+    )?;
+    if n == 0 {
+        return Err(DbError::NotFound(format!("root id {root_id}")));
+    }
+    Ok(())
+}
+
+/// Hard-remove a root and cascade-delete its `files` and `scan_jobs` rows.
+/// The FTS triggers on `files` keep the FTS5 table in sync via the cascade.
+pub fn delete_root(conn: &Connection, root_id: i64) -> Result<()> {
+    let n = conn.execute("DELETE FROM roots WHERE id = ?1", params![root_id])?;
+    if n == 0 {
+        return Err(DbError::NotFound(format!("root id {root_id}")));
+    }
+    Ok(())
+}

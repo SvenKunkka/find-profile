@@ -49,6 +49,39 @@ pub fn finish_scan_job(
     Ok(())
 }
 
+/// Fetch the most recent `scan_jobs` row for a given root, if any.
+///
+/// Used by the `get_scan_status` command to answer "what is this root doing
+/// right now?" — returns `Ok(None)` when the root has never been scanned.
+pub fn get_latest_scan_job_for_root(
+    conn: &Connection,
+    root_id: i64,
+) -> Result<Option<ScanJob>> {
+    let job = conn
+        .query_row(
+            "SELECT id, root_id, status, scanned_count, error_count, started_at, finished_at, error_message
+             FROM scan_jobs
+             WHERE root_id = ?1
+             ORDER BY id DESC
+             LIMIT 1",
+            params![root_id],
+            |row| {
+                Ok(ScanJob {
+                    id: row.get(0)?,
+                    root_id: row.get(1)?,
+                    status: row.get(2)?,
+                    scanned_count: row.get(3)?,
+                    error_count: row.get(4)?,
+                    started_at: row.get(5)?,
+                    finished_at: row.get(6)?,
+                    error_message: row.get(7)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(job)
+}
+
 pub fn get_scan_job(conn: &Connection, job_id: i64) -> Result<ScanJob> {
     let job = conn
         .query_row(
