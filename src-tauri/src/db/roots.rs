@@ -86,6 +86,14 @@ fn root_from_row(row: &Row) -> Result<Root, rusqlite::Error> {
     })
 }
 
+pub fn detect_root_kind(path: &str) -> RootKind {
+    if path.starts_with("/Volumes/") {
+        RootKind::Nas
+    } else {
+        RootKind::Local
+    }
+}
+
 pub fn add_root(db: &Database, path: &str, kind: RootKind) -> DbResult<Root> {
     let now = Utc::now().timestamp();
     let conn = db.conn.lock().unwrap();
@@ -102,6 +110,11 @@ pub fn add_root(db: &Database, path: &str, kind: RootKind) -> DbResult<Root> {
     )?;
     stmt.query_row(params![id], root_from_row)
         .map_err(DbError::Sqlite)
+}
+
+pub fn add_root_with_detection(db: &Database, path: &str, kind: Option<RootKind>) -> DbResult<Root> {
+    let detected_kind = kind.unwrap_or_else(|| detect_root_kind(path));
+    add_root(db, path, detected_kind)
 }
 
 pub fn get_root_by_id(db: &Database, id: i64) -> DbResult<Root> {
@@ -219,5 +232,44 @@ mod tests {
         let db = create_test_db();
         let result = update_root_status(&db, 9999, RootStatus::Error);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_detect_root_kind_nas_path() {
+        assert_eq!(detect_root_kind("/Volumes/NAS/data"), RootKind::Nas);
+        assert_eq!(detect_root_kind("/Volumes/ExternalDrive"), RootKind::Nas);
+        assert_eq!(detect_root_kind("/Volumes/USB"), RootKind::Nas);
+    }
+
+    #[test]
+    fn test_detect_root_kind_local_path() {
+        assert_eq!(detect_root_kind("/Users/user/documents"), RootKind::Local);
+        assert_eq!(detect_root_kind("/Applications"), RootKind::Local);
+        assert_eq!(detect_root_kind("/tmp/test"), RootKind::Local);
+        assert_eq!(detect_root_kind("/Volumes"), RootKind::Local);
+    }
+
+    #[test]
+    fn test_add_root_with_detection_auto_nas() {
+        let db = create_test_db();
+        let root = add_root_with_detection(&db, "/Volumes/MyNAS", None).unwrap();
+        assert_eq!(root.kind, RootKind::Nas);
+    }
+
+    #[test]
+    fn test_add_root_with_detection_auto_local() {
+        let db = create_test_db();
+        let root = add_root_with_detection(&db, "/Users/user/Documents", None).unwrap();
+        assert_eq!(root.kind, RootKind::Local);
+    }
+
+    #[test]
+    fn test_add_root_with_detection_manual_override() {
+        let db = create_test_db();
+        let root = add_root_with_detection(&db, "/Volumes/MyNAS", Some(RootKind::Local)).unwrap();
+        assert_eq!(root.kind, RootKind::Local);
+
+        let root2 = add_root_with_detection(&db, "/Users/user/Documents", Some(RootKind::Nas)).unwrap();
+        assert_eq!(root2.kind, RootKind::Nas);
     }
 }
