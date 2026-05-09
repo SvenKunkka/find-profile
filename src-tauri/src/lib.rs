@@ -262,7 +262,13 @@ async fn rescan_root(app: AppHandle, root_id: i64) -> ApiResponse<ScanStatus> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let db_path = std::path::PathBuf::from("find-profile-index.db");
+    let db_dir = dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("find-profile");
+    
+    std::fs::create_dir_all(&db_dir).ok();
+    
+    let db_path = db_dir.join("index.db");
     
     let db = Database::new(db_path).expect("Failed to initialize database");
     
