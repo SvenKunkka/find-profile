@@ -4,6 +4,7 @@ pub mod files;
 pub mod scan_jobs;
 pub mod transaction;
 pub mod init;
+pub mod scanner;
 
 use rusqlite::Connection;
 use std::path::PathBuf;

@@ -93,14 +93,14 @@ pub fn update_scan_job_progress(db: &Database, job_id: i64, scanned_count: i64, 
     let conn = db.conn.lock().unwrap();
 
     let rows_affected = conn.execute(
-        "UPDATE scan_jobs SET scanned_count = ?1, error_count = ?2 WHERE id = ?3 AND status = 'pending'",
+        "UPDATE scan_jobs SET scanned_count = ?1, error_count = ?2 WHERE id = ?3 AND status IN ('pending', 'running')",
         params![scanned_count, error_count, job_id],
     )?;
 
     drop(conn);
 
     if rows_affected == 0 {
-        return Err(DbError::NotFound(format!("ScanJob with id {} not found or not in pending state", job_id)));
+        return Err(DbError::NotFound(format!("ScanJob with id {} not found or not in valid state", job_id)));
     }
 
     Ok(())
