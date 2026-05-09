@@ -28,8 +28,18 @@ pub fn add_index_root(
     path: String,
     kind: Option<String>,
 ) -> CommandResult<Root> {
-    let conn = lock_conn(&state)?;
-    let root = register_root(&conn, &path, kind.as_deref())?;
+    let root = {
+        let conn = lock_conn(&state)?;
+        register_root(&conn, &path, kind.as_deref())?
+    };
+    // Best-effort: a watcher failure must not undo the registration. If the
+    // user added a NAS root, `start` is a no-op by design.
+    if let Err(e) = state.watchers.start(&root, state.conn.clone()) {
+        eprintln!(
+            "watcher: failed to start watcher for new root {} ({}): {e}",
+            root.id, root.path
+        );
+    }
     Ok(root)
 }
 
@@ -206,6 +216,11 @@ pub fn remove_index_root(
     root_id: i64,
     keep_index: bool,
 ) -> CommandResult<()> {
+    // Stop the watcher *before* mutating the DB so a stale event from notify
+    // can't race with a removed/disabled root row.
+    if let Err(e) = state.watchers.stop(root_id) {
+        eprintln!("watcher: failed to stop watcher for root {root_id}: {e}");
+    }
     let conn = lock_conn(&state)?;
     if keep_index {
         db::disable_root(&conn, root_id)?;

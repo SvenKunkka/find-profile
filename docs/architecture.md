@@ -198,10 +198,36 @@ disconnected ── 重连 + rescan 成功 ────────────�
   - 注意：仅在扫描**成功完成**时执行清理；失败 / 中断不清理，避免数据丢失。
 - 进度通过 Tauri event `scan-progress` 回推前端，包含已扫描文件数。
 
-### 8.2 V2：本地目录 FS Watch
+### 8.2 本地目录 FS Watch（已落地，含限制）
 
-- 使用 `notify` crate 对 `local` 根做 watch，增量更新 `files` 表。
-- 仅对 `local` 根开启；`nas` 根禁用 watch（macOS FSEvents 在 SMB/NFS 上不靠谱）。
+实现位置：`src-tauri/src/watcher/`。
+
+落地范围：
+- 仅监听 `kind = local` 的根。`should_watch_root(RootKind)` 是单一权威：`Local => true`、`Nas => false`，并附带单元测试，未来引入并行实现也会立即失败。
+- 使用 `notify = "6"` 的 `RecommendedWatcher`（macOS 下走 FSEvents），递归监听整棵子树（`RecursiveMode::Recursive`）。
+- App 启动时 `WatcherRegistry::restore_all` 遍历所有 `enabled && local` 的根并开 watcher；NAS 与 disabled 根直接跳过。
+- `add_index_root` 命令成功注册后立刻调 `start` 给新 local 根挂 watcher；`remove_index_root` 在改库前先 `stop`，避免落后事件 race 写已被删除的行。
+
+事件 → 索引映射（`watcher/handler.rs`）：
+- `Create(_)` / `Modify(Data \| Metadata \| Any \| Other)` → `db::upsert_file`
+- `Modify(Name(From))` → `db::remove_file`
+- `Modify(Name(To))` → `db::upsert_file`
+- `Modify(Name(Both))`（路径数=2 时）→ 先 remove old、再 upsert new
+- `Remove(_)` → `db::remove_file`
+- 其他类别忽略
+
+**MVP 限制（明确不做）：**
+1. **不防抖。** 突发事件会触发重复 upsert；`upsert_file` 是幂等的，所以正确性不受影响，只是写放大。`notify-debouncer-full` 是 V2+ 的事项。
+2. **不前端推送。** 监听事件不通过 Tauri Event 广播，前端不会自动看到索引更新；需要刷新搜索/列表。`scan-progress` 之类事件接入是后续 stage。
+3. **不跟随符号链接。** 与 `scanner` 一致；symlink 本身被索引为条目，但其目标不被独立监听。
+4. **错误吞回 stderr。** notify 报告的 `notify::Error`、单条事件应用 DB 失败、watch 路径消失等，全部 `eprintln!` 后继续。绝不向上 panic 或终止 app。这条是硬约束 —— 监听器永远不能让 app 崩。
+5. **不感知 NAS 重新挂载。** NAS 根永远不开 watcher；用户重连后必须手动 `Scan/Rescan`。
+6. **不处理 Watch 死亡。** 单个 watcher 失败（路径被整体删除等）会让那个根的监听静默失效，下次 app 重启会通过 `restore_all` 重建。中途自愈是 V2。
+7. **删除 vs 标记不可访问。** 文件被删 / 重命名 from-path → 直接从 `files` 删除（FTS5 触发器同步清 fts 表）。"标记 unavailable" 留给 NAS root 状态层（disconnected 时整 root 的所有结果在 UI 显示 unavailable）。
+
+测试覆盖（`src-tauri/src/watcher/mod.rs::tests`）：
+- 确定性：NAS 根 `start` 返回 false、Local 根 start/stop 计数正确、`restore_all` 排除 NAS 与 disabled、stop 幂等。
+- 真实 FS：在 `temp_dir/find_profile_watcher_test_*` 下创建文件 → 8s 内进索引；删除 → 8s 内出索引；重命名 → 新名进索引、旧名退索引。这几条因 FSEvents 异步可能在重负载下偶有 flake，超时窗口给得宽。
 
 ### 8.3 V2：NAS 目录定时扫描
 
