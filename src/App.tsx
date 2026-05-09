@@ -61,31 +61,71 @@ interface AppPaths {
   log_dir: string;
 }
 
-interface CommandError {
-  code: string;
-  message: string;
-}
-
 const SEARCH_DEBOUNCE_MS = 200;
 const PAGE_SIZE = 50;
 const SCAN_POLL_MS = 1500;
 const SCAN_POLL_TIMEOUT_MS = 5 * 60 * 1000;
 
-function formatError(err: unknown): string {
-  if (err == null) return "unknown error";
-  if (typeof err === "string") return err;
-  if (typeof err === "object") {
-    const maybe = err as Partial<CommandError>;
-    if (typeof maybe.message === "string" && maybe.message.length > 0) {
-      return maybe.message;
-    }
-    try {
-      return JSON.stringify(err);
-    } catch {
-      return Object.prototype.toString.call(err);
-    }
+/**
+ * Map a Tauri CommandError (or anything else thrown out of invoke()) to a
+ * Chinese UI-facing string. The English `message` is intentionally dropped
+ * so we never show raw technical text to the user; the original error is
+ * always preserved in the matching `console.error` call for diagnostics.
+ */
+function translateError(err: unknown): string {
+  const code =
+    err && typeof err === "object"
+      ? (err as { code?: string }).code
+      : undefined;
+  switch (code) {
+    case "not_found":
+      return "未找到对应记录";
+    case "invalid_kind":
+      return "根目录类型不合法";
+    case "invalid_source":
+      return "来源筛选不合法";
+    case "invalid_type_filter":
+      return "类型筛选不合法";
+    case "invalid_sort":
+      return "排序方式不合法";
+    case "nas_unavailable":
+      return "NAS 当前不可访问，请重新连接 NAS 后再次扫描";
+    case "root_unavailable":
+      return "根目录当前不可访问";
+    case "db":
+      return "数据库错误";
+    case "io":
+      return "输入 / 输出错误";
+    case "unsupported":
+      return "不支持的操作";
+    case "internal":
+      return "内部错误";
+    case "path":
+      return "路径解析失败";
+    case "scan":
+      return "扫描失败";
+    case "tauri":
+      return "系统错误";
+    default:
+      return "未知错误";
   }
-  return String(err);
+}
+
+function rootKindLabel(k: RootKind): string {
+  return k === "local" ? "本地" : "NAS";
+}
+
+function rootStatusLabel(s: RootStatus): string {
+  switch (s) {
+    case "available":
+      return "可用";
+    case "disconnected":
+      return "已断开";
+    case "scanning":
+      return "扫描中";
+    case "error":
+      return "错误";
+  }
 }
 
 function formatSize(bytes: number | null, isDir: boolean): string {
@@ -104,9 +144,9 @@ function formatSize(bytes: number | null, isDir: boolean): string {
 
 function accessibilityLabel(hit: FileHit): string {
   if (hit.root_status === "disconnected" || hit.root_status === "error") {
-    return "unavailable";
+    return "不可用";
   }
-  return hit.is_accessible ? "yes" : "no";
+  return hit.is_accessible ? "是" : "否";
 }
 
 function accessibilityClass(hit: FileHit): string {
@@ -185,7 +225,7 @@ function App() {
       );
     } catch (e) {
       console.error("list_index_roots failed", e);
-      setError(`Failed to load roots: ${formatError(e)}`);
+      setError(`加载索引目录失败：${translateError(e)}`);
     }
   }
 
@@ -225,7 +265,7 @@ function App() {
         } catch (e) {
           if (!cancelled) {
             console.error("search_files failed", e);
-            setError(`Search failed: ${formatError(e)}`);
+            setError(`搜索文件失败：${translateError(e)}`);
           }
         }
       })();
@@ -249,7 +289,7 @@ function App() {
       selected = await open({ directory: true, multiple: false });
     } catch (error) {
       console.error("directory dialog failed", error);
-      setError(`Directory picker failed: ${formatError(error)}`);
+      setError(`目录选择器失败：${translateError(error)}`);
       return;
     }
 
@@ -268,7 +308,7 @@ function App() {
       await refreshRoots();
     } catch (e) {
       console.error("add_index_root failed", e);
-      setError(`Failed to add root: ${formatError(e)}`);
+      setError(`添加索引目录失败：${translateError(e)}`);
     }
   }
 
@@ -278,7 +318,7 @@ function App() {
       await invoke<boolean>("cancel_scan", { rootId });
     } catch (e) {
       console.error("cancel_scan failed", e);
-      setError(`Failed to cancel scan: ${formatError(e)}`);
+      setError(`取消扫描失败：${translateError(e)}`);
     }
   }
 
@@ -308,7 +348,7 @@ function App() {
       }, SCAN_POLL_MS);
     } catch (e) {
       console.error("start_scan failed", e);
-      setError(`Failed to start scan: ${formatError(e)}`);
+      setError(`扫描目录失败：${translateError(e)}`);
     }
   }
 
@@ -318,7 +358,7 @@ function App() {
       await invoke("open_file", { path });
     } catch (e) {
       console.error("open_file failed", e);
-      setError(`Failed to open file: ${formatError(e)}`);
+      setError(`打开文件失败：${translateError(e)}`);
     }
   }
 
@@ -334,7 +374,7 @@ function App() {
         setAppPaths(p);
       } catch (e) {
         console.error("settings load failed", e);
-        setError(`Failed to load settings: ${formatError(e)}`);
+        setError(`加载设置失败：${translateError(e)}`);
       }
     }
   }
@@ -351,7 +391,7 @@ function App() {
       setSettings(saved);
     } catch (e) {
       console.error("update_settings failed", e);
-      setError(`Failed to save settings: ${formatError(e)}`);
+      setError(`保存设置失败：${translateError(e)}`);
     } finally {
       setSettingsBusy(false);
     }
@@ -360,16 +400,12 @@ function App() {
   async function handleClearIndex() {
     if (
       !window.confirm(
-        "Clear the entire file index?\n\nRoots and settings are kept, but every cached file row is removed. Search will return nothing until you rescan."
+        "确定要清理整个文件索引吗？\n\n根目录和设置会保留，但所有已索引的文件记录会被清除。在重新扫描之前搜索将返回空结果。"
       )
     ) {
       return;
     }
-    if (
-      !window.confirm(
-        "Are you absolutely sure? This action cannot be undone."
-      )
-    ) {
+    if (!window.confirm("确认清理？此操作无法撤销。")) {
       return;
     }
     try {
@@ -378,22 +414,20 @@ function App() {
       setResults([]);
     } catch (e) {
       console.error("clear_index failed", e);
-      setError(`Failed to clear index: ${formatError(e)}`);
+      setError(`清理索引失败：${translateError(e)}`);
     }
   }
 
   async function handleRebuildIndex() {
     if (
       !window.confirm(
-        "Rebuild every enabled root?\n\nThe current index is wiped first, then a scan is started for each root. Existing search results disappear immediately and reappear as scans complete."
+        "确定要重建所有启用的根目录吗？\n\n当前索引会先被清空，然后对每个根目录启动新的扫描。已有搜索结果会立即消失，扫描完成后逐步恢复。"
       )
     ) {
       return;
     }
     if (
-      !window.confirm(
-        "Confirm: clear current index and rescan every enabled root?"
-      )
+      !window.confirm("确认：清空当前索引并重新扫描所有启用的根目录？")
     ) {
       return;
     }
@@ -404,7 +438,7 @@ function App() {
       await refreshRoots();
     } catch (e) {
       console.error("rebuild_index failed", e);
-      setError(`Failed to rebuild index: ${formatError(e)}`);
+      setError(`重建索引失败：${translateError(e)}`);
     }
   }
 
@@ -413,7 +447,7 @@ function App() {
       await invoke("open_log_dir");
     } catch (e) {
       console.error("open_log_dir failed", e);
-      setError(`Failed to open log directory: ${formatError(e)}`);
+      setError(`打开日志目录失败：${translateError(e)}`);
     }
   }
 
@@ -423,7 +457,7 @@ function App() {
       await invoke("reveal_in_finder", { path });
     } catch (e) {
       console.error("reveal_in_finder failed", e);
-      setError(`Failed to reveal in Finder: ${formatError(e)}`);
+      setError(`在 Finder 中显示文件失败：${translateError(e)}`);
     }
   }
 
@@ -435,9 +469,16 @@ function App() {
   const resultCountLabel = (() => {
     if (!hasQuery) return "";
     if (!searched) return "…";
-    if (results.length === 0) return "0 results";
-    return `${results.length} on page ${page + 1}`;
+    if (results.length === 0) return "共 0 条";
+    return `第 ${page + 1} 页 · ${results.length} 条`;
   })();
+
+  function sourceFilterLabel(s: SourceFilter): string {
+    return { all: "全部", local: "本地", nas: "NAS" }[s];
+  }
+  function typeFilterLabel(t: TypeFilter): string {
+    return { all: "全部", files: "文件", dirs: "文件夹" }[t];
+  }
 
   return (
     <div className="app">
@@ -446,8 +487,8 @@ function App() {
         <input
           type="search"
           className="search-input"
-          placeholder="Search files..."
-          aria-label="Search files"
+          placeholder="搜索文件..."
+          aria-label="搜索文件"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
         />
@@ -458,26 +499,26 @@ function App() {
           type="button"
           className="btn-settings"
           onClick={() => void openSettings()}
-          aria-label="Open settings"
+          aria-label="打开设置"
         >
-          Settings
+          设置
         </button>
       </header>
 
       <main className="app-body">
-        <aside className="roots-panel" aria-label="Indexed Roots">
+        <aside className="roots-panel" aria-label="索引目录">
           <div className="panel-header">
-            <h2 className="panel-title">Indexed Roots</h2>
+            <h2 className="panel-title">索引目录</h2>
             <button
               type="button"
               className="btn-add-root"
               onClick={handleAddRoot}
             >
-              + Add Root
+              + 添加目录
             </button>
           </div>
           {roots.length === 0 ? (
-            <div className="panel-empty">No roots yet.</div>
+            <div className="panel-empty">还没有添加索引目录。</div>
           ) : (
             <ul className="roots-list">
               {roots.map((r) => (
@@ -492,9 +533,11 @@ function App() {
                     {r.path}
                   </div>
                   <div className="root-meta">
-                    <span className={`root-kind kind-${r.kind}`}>{r.kind}</span>
+                    <span className={`root-kind kind-${r.kind}`}>
+                      {rootKindLabel(r.kind)}
+                    </span>
                     <span className={`root-status status-${r.status}`}>
-                      {r.status}
+                      {rootStatusLabel(r.status)}
                     </span>
                     <button
                       type="button"
@@ -510,72 +553,72 @@ function App() {
                         }
                       }}
                     >
-                      {r.status === "scanning" ? "Cancel" : "Scan"}
+                      {r.status === "scanning" ? "取消" : "扫描"}
                     </button>
                   </div>
                 </li>
               ))}
             </ul>
           )}
-          <div className="roots-hints" role="note" aria-label="NAS notes">
-            <p>NAS scanning speed depends on network and NAS performance.</p>
-            <p>Disconnected NAS roots keep their old index.</p>
+          <div className="roots-hints" role="note" aria-label="NAS 提示">
+            <p>NAS 扫描速度取决于网络和 NAS 性能。</p>
+            <p>NAS 断开后会保留旧索引，不会自动删除。</p>
           </div>
         </aside>
 
-        <section className="results-panel" aria-label="Results">
+        <section className="results-panel" aria-label="搜索结果">
           <div className="panel-header">
-            <h2 className="panel-title">Results</h2>
+            <h2 className="panel-title">搜索结果</h2>
           </div>
 
-          <div className="filter-bar" role="toolbar" aria-label="Search filters">
+          <div className="filter-bar" role="toolbar" aria-label="搜索筛选">
             <label className="filter-field">
-              <span>Ext</span>
+              <span>扩展名</span>
               <input
                 type="text"
                 value={extensionInput}
                 onChange={(e) => setExtensionInput(e.target.value)}
                 placeholder="pdf, txt, jpg"
-                aria-label="Filter by extension"
+                aria-label="按扩展名筛选"
               />
             </label>
             <label className="filter-field">
-              <span>Source</span>
+              <span>来源</span>
               <select
                 value={sourceFilter}
                 onChange={(e) =>
                   setSourceFilter(e.target.value as SourceFilter)
                 }
-                aria-label="Filter by source"
+                aria-label="按来源筛选"
               >
-                <option value="all">All</option>
-                <option value="local">Local</option>
+                <option value="all">全部</option>
+                <option value="local">本地</option>
                 <option value="nas">NAS</option>
               </select>
             </label>
             <label className="filter-field">
-              <span>Type</span>
+              <span>类型</span>
               <select
                 value={typeFilter}
                 onChange={(e) => setTypeFilter(e.target.value as TypeFilter)}
-                aria-label="Filter by type"
+                aria-label="按类型筛选"
               >
-                <option value="all">All</option>
-                <option value="files">Files</option>
-                <option value="dirs">Folders</option>
+                <option value="all">全部</option>
+                <option value="files">文件</option>
+                <option value="dirs">文件夹</option>
               </select>
             </label>
             <label className="filter-field">
-              <span>Sort</span>
+              <span>排序</span>
               <select
                 value={sortBy}
                 onChange={(e) => setSortBy(e.target.value as SortBy)}
-                aria-label="Sort by"
+                aria-label="排序方式"
               >
-                <option value="relevance">Relevance</option>
-                <option value="modified">Modified</option>
-                <option value="size">Size</option>
-                <option value="name">Name</option>
+                <option value="relevance">相关性</option>
+                <option value="modified">修改时间</option>
+                <option value="size">大小</option>
+                <option value="name">名称</option>
               </select>
             </label>
           </div>
@@ -583,34 +626,35 @@ function App() {
           {!hasQuery ? (
             <div className="panel-empty empty-help" role="status">
               <p>
-                <strong>Type to search</strong> indexed files by name or path.
+                <strong>输入关键词</strong>搜索已索引文件（按名称或路径匹配）。
               </p>
               <p>
-                Add a root in the left panel and click <em>Scan</em> to populate
-                the index. Filenames rank above path matches.
+                在左侧面板添加目录并点击<em>扫描</em>后开始建立索引。
+                文件名匹配优先于路径匹配。
               </p>
             </div>
           ) : !searched ? (
-            <div className="panel-empty empty-help">Searching…</div>
+            <div className="panel-empty empty-help">搜索中…</div>
           ) : results.length === 0 ? (
             <div className="panel-empty empty-help" role="status">
               <p>
-                No matches for <strong>"{trimmedQuery}"</strong>
+                没有找到匹配 <strong>"{trimmedQuery}"</strong> 的文件
                 {extensions.length > 0
-                  ? ` (extensions: ${extensions.join(", ")})`
+                  ? `（扩展名：${extensions.join("、")}）`
                   : ""}
-                {sourceFilter !== "all" ? ` · source: ${sourceFilter}` : ""}
-                {typeFilter !== "all" ? ` · type: ${typeFilter}` : ""}
-                .
+                {sourceFilter !== "all"
+                  ? ` · 来源：${sourceFilterLabel(sourceFilter)}`
+                  : ""}
+                {typeFilter !== "all"
+                  ? ` · 类型：${typeFilterLabel(typeFilter)}`
+                  : ""}
+                。
               </p>
               <ul>
-                <li>Try a shorter or different keyword.</li>
-                <li>Check the spelling.</li>
-                <li>Loosen the filters above (Ext / Source / Type).</li>
-                <li>
-                  Confirm the file's root is added and scanned in the left
-                  panel.
-                </li>
+                <li>请尝试更短或不同的关键词。</li>
+                <li>检查拼写是否正确。</li>
+                <li>放宽上方的筛选条件（扩展名 / 来源 / 类型）。</li>
+                <li>确认该文件所在的根目录已经在左侧添加并扫描完成。</li>
               </ul>
             </div>
           ) : (
@@ -630,15 +674,15 @@ function App() {
                   </colgroup>
                   <thead>
                     <tr>
-                      <th>Name</th>
-                      <th>Path</th>
-                      <th>Extension</th>
-                      <th className="num">Size</th>
-                      <th>Modified</th>
-                      <th>Kind</th>
-                      <th>Source</th>
-                      <th>Accessible</th>
-                      <th aria-label="Actions"></th>
+                      <th>名称</th>
+                      <th>路径</th>
+                      <th>扩展名</th>
+                      <th className="num">大小</th>
+                      <th>修改时间</th>
+                      <th>类型</th>
+                      <th>来源</th>
+                      <th>可访问</th>
+                      <th aria-label="操作"></th>
                     </tr>
                   </thead>
                   <tbody>
@@ -659,12 +703,12 @@ function App() {
                           {formatSize(hit.size, hit.is_dir)}
                         </td>
                         <td>{formatModified(hit.modified_at)}</td>
-                        <td>{hit.is_dir ? "folder" : "file"}</td>
+                        <td>{hit.is_dir ? "文件夹" : "文件"}</td>
                         <td>
                           <span
                             className={`root-kind kind-${hit.source_kind}`}
                           >
-                            {hit.source_kind}
+                            {rootKindLabel(hit.source_kind)}
                           </span>
                         </td>
                         <td className={accessibilityClass(hit)}>
@@ -679,7 +723,7 @@ function App() {
                               void handleReveal(hit.path);
                             }}
                           >
-                            Reveal
+                            在 Finder 中显示
                           </button>
                         </td>
                       </tr>
@@ -687,24 +731,24 @@ function App() {
                   </tbody>
                 </table>
               </div>
-              <div className="pagination" aria-label="Pagination">
+              <div className="pagination" aria-label="分页">
                 <button
                   type="button"
                   onClick={() => setPage((p) => Math.max(0, p - 1))}
                   disabled={isFirstPage}
                 >
-                  ← Prev
+                  ← 上一页
                 </button>
                 <span className="pagination-page">
-                  Page {page + 1}
-                  {hasNextPage ? "" : " · end"}
+                  第 {page + 1} 页
+                  {hasNextPage ? "" : " · 末页"}
                 </span>
                 <button
                   type="button"
                   onClick={() => setPage((p) => p + 1)}
                   disabled={!hasNextPage}
                 >
-                  Next →
+                  下一页 →
                 </button>
               </div>
             </>
@@ -712,26 +756,24 @@ function App() {
         </section>
       </main>
 
-      <footer className="status-bar" aria-label="Status">
+      <footer className="status-bar" aria-label="状态">
         <div className="status-cell">
-          <span className="status-label">Status</span>
+          <span className="status-label">状态</span>
           <span className="status-value">
-            Ready · {roots.length} root{roots.length === 1 ? "" : "s"}
+            就绪 · {roots.length} 个根目录
             {hasQuery && searched
-              ? ` · page ${page + 1}: ${results.length} hit${
-                  results.length === 1 ? "" : "s"
-                }`
+              ? ` · 第 ${page + 1} 页：${results.length} 条`
               : ""}
           </span>
         </div>
         <div className="status-cell">
-          <span className="status-label">Root</span>
+          <span className="status-label">根目录</span>
           <span className="status-value" title={currentRoot?.path ?? undefined}>
             {currentRoot?.path ?? "—"}
           </span>
         </div>
         <div className="status-cell">
-          <span className="status-label">Path</span>
+          <span className="status-label">路径</span>
           <span className="status-value" title={currentPath ?? undefined}>
             {currentPath ?? "—"}
           </span>
@@ -742,7 +784,7 @@ function App() {
           }`}
           role={error ? "alert" : undefined}
         >
-          <span className="status-label">Error</span>
+          <span className="status-label">错误</span>
           <span className="status-value" title={error ?? undefined}>
             {error ?? "—"}
           </span>
@@ -751,7 +793,7 @@ function App() {
               type="button"
               className="status-dismiss"
               onClick={() => setError(null)}
-              aria-label="Dismiss error"
+              aria-label="关闭错误提示"
             >
               ×
             </button>
@@ -769,29 +811,29 @@ function App() {
             className="modal"
             role="dialog"
             aria-modal="true"
-            aria-label="Settings"
+            aria-label="设置"
             onClick={(e) => e.stopPropagation()}
           >
             <header className="modal-header">
-              <h2>Settings</h2>
+              <h2>设置</h2>
               <button
                 type="button"
                 className="modal-close"
                 onClick={() => setShowSettings(false)}
-                aria-label="Close settings"
+                aria-label="关闭设置"
               >
                 ×
               </button>
             </header>
             <div className="modal-body">
               {!settings ? (
-                <p className="modal-loading">Loading…</p>
+                <p className="modal-loading">加载中…</p>
               ) : (
                 <>
                   <section className="settings-section">
-                    <h3>Search</h3>
+                    <h3>搜索</h3>
                     <label className="settings-row">
-                      <span>Default page size</span>
+                      <span>每页默认数量</span>
                       <input
                         type="number"
                         min={1}
@@ -808,7 +850,7 @@ function App() {
                   </section>
 
                   <section className="settings-section">
-                    <h3>Indexing</h3>
+                    <h3>索引选项</h3>
                     <label className="settings-row">
                       <input
                         type="checkbox"
@@ -817,7 +859,7 @@ function App() {
                           void patchSettings({ index_files: e.target.checked })
                         }
                       />
-                      <span>Index files</span>
+                      <span>索引文件</span>
                     </label>
                     <label className="settings-row">
                       <input
@@ -829,7 +871,7 @@ function App() {
                           })
                         }
                       />
-                      <span>Index folders</span>
+                      <span>索引文件夹</span>
                     </label>
                     <label className="settings-row">
                       <input
@@ -842,17 +884,17 @@ function App() {
                         }
                       />
                       <span>
-                        Show hidden files
+                        显示隐藏文件
                         <em className="settings-hint">
                           {" "}
-                          (basenames starting with <code>.</code>)
+                          （文件名以 <code>.</code> 开头的文件）
                         </em>
                       </span>
                     </label>
                   </section>
 
                   <section className="settings-section">
-                    <h3>Watchers & NAS</h3>
+                    <h3>监听与 NAS</h3>
                     <label className="settings-row">
                       <input
                         type="checkbox"
@@ -863,14 +905,14 @@ function App() {
                           })
                         }
                       />
-                      <span>Restore local-root watchers at startup</span>
+                      <span>启动时恢复本地目录监听</span>
                     </label>
                     <label className="settings-row">
-                      <span>NAS scan interval (minutes)</span>
+                      <span>NAS 扫描间隔（分钟）</span>
                       <input
                         type="number"
                         min={0}
-                        placeholder="off"
+                        placeholder="关闭"
                         value={settings.nas_scan_interval_minutes ?? ""}
                         onChange={(e) => {
                           const raw = e.target.value;
@@ -890,25 +932,25 @@ function App() {
                         readOnly
                       />
                       <span>
-                        Keep index when NAS disconnects
+                        NAS 断开时保留索引
                         <em className="settings-hint">
                           {" "}
-                          (always on — see docs/architecture.md)
+                          （始终开启 - 见 docs/architecture.md）
                         </em>
                       </span>
                     </label>
                   </section>
 
                   <section className="settings-section">
-                    <h3>Storage</h3>
+                    <h3>存储</h3>
                     <div className="settings-row">
-                      <span>Database</span>
+                      <span>数据库</span>
                       <code className="settings-path" title={appPaths?.db_path}>
                         {appPaths?.db_path ?? "—"}
                       </code>
                     </div>
                     <div className="settings-row">
-                      <span>Logs</span>
+                      <span>日志</span>
                       <code
                         className="settings-path"
                         title={appPaths?.log_dir}
@@ -920,16 +962,15 @@ function App() {
                         className="btn-secondary"
                         onClick={() => void handleOpenLogDir()}
                       >
-                        Open
+                        打开
                       </button>
                     </div>
                   </section>
 
                   <section className="settings-section settings-section-danger">
-                    <h3>Danger zone</h3>
+                    <h3>危险操作</h3>
                     <p className="settings-danger-note">
-                      These actions affect every root and cannot be undone.
-                      Each click asks for two confirmations.
+                      这些操作会影响所有根目录，且无法撤销。每次点击都会请求两次确认。
                     </p>
                     <div className="settings-row">
                       <button
@@ -937,20 +978,20 @@ function App() {
                         className="btn-danger"
                         onClick={() => void handleClearIndex()}
                       >
-                        Clear index
+                        清理索引
                       </button>
                       <button
                         type="button"
                         className="btn-danger"
                         onClick={() => void handleRebuildIndex()}
                       >
-                        Rebuild all indexes
+                        重建全部索引
                       </button>
                     </div>
                   </section>
 
                   {settingsBusy && (
-                    <p className="modal-loading">Saving…</p>
+                    <p className="modal-loading">保存中…</p>
                   )}
                 </>
               )}
