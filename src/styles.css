@@ -102,17 +102,39 @@ body {
   color: #3a3a3c;
 }
 
-.panel-action {
+.btn-add-root {
+  position: relative;
+  z-index: 1;
   font: inherit;
   font-size: 12px;
-  padding: 2px 8px;
+  font-weight: 500;
+  padding: 3px 10px;
   border: 1px solid #c7c7cc;
-  border-radius: 3px;
+  border-radius: 4px;
   background: #ffffff;
+  color: #1c1c1e;
   cursor: pointer;
+  white-space: nowrap;
+  user-select: none;
+  transition: background-color 0.1s ease, border-color 0.1s ease;
 }
 
-.panel-action:disabled {
+.btn-add-root:hover {
+  background: #f0f0f3;
+  border-color: #0a84ff;
+}
+
+.btn-add-root:active {
+  background: #e5e5ea;
+}
+
+.btn-add-root:focus-visible {
+  outline: none;
+  border-color: #0a84ff;
+  box-shadow: 0 0 0 2px rgba(10, 132, 255, 0.25);
+}
+
+.btn-add-root:disabled {
   color: #8e8e93;
   cursor: not-allowed;
 }
@@ -157,10 +179,17 @@ body {
     color: #d1d1d6;
   }
   .search-input,
-  .panel-action {
+  .btn-add-root {
     background: #2c2c2e;
     color: #f2f2f7;
     border-color: #3a3a3c;
+  }
+  .btn-add-root:hover {
+    background: #3a3a3c;
+    border-color: #0a84ff;
+  }
+  .btn-add-root:active {
+    background: #48484a;
   }
   .search-input:focus {
     border-color: #0a84ff;
