@@ -62,6 +62,8 @@ CREATE TABLE IF NOT EXISTS scan_jobs (
     started_at TEXT NOT NULL,
     finished_at TEXT,
     error_message TEXT,
+    estimated_total_count INTEGER,
+    current_path TEXT,
     FOREIGN KEY(root_id) REFERENCES roots(id) ON DELETE CASCADE
 );
 
@@ -74,7 +76,21 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 "#;
 
+/// Idempotent ALTER TABLE statements applied after the canonical CREATE
+/// TABLE. Fresh installs already get the new columns from `SCHEMA_SQL`;
+/// existing on-disk databases need these to add the columns. Each statement
+/// is wrapped in `.ok()` so the SQLite "duplicate column name" error from a
+/// re-run is silently ignored — there is no point in matching on the error
+/// string.
+const MIGRATIONS: &[&str] = &[
+    "ALTER TABLE scan_jobs ADD COLUMN estimated_total_count INTEGER",
+    "ALTER TABLE scan_jobs ADD COLUMN current_path TEXT",
+];
+
 pub fn apply(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA_SQL)?;
+    for stmt in MIGRATIONS {
+        let _ = conn.execute(stmt, []);
+    }
     Ok(())
 }

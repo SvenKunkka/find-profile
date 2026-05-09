@@ -418,6 +418,15 @@ body {
   letter-spacing: 0;
 }
 
+.scan-progress {
+  /* Deliberately muted: progress is informative, not the headline. */
+  color: #8e8e93;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
 /* ---------- kind / status badges ---------- */
 
 .root-kind,
@@ -984,6 +993,9 @@ body {
     background: #3a1f1f;
     color: #ff9b9b;
     border-color: #4a2c2c;
+  }
+  .scan-progress {
+    color: #8e8e93;
   }
   .results-table thead {
     background: #2c2c2e;

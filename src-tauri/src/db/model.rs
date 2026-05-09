@@ -194,6 +194,12 @@ pub struct ScanJob {
     pub status: ScanJobStatus,
     pub scanned_count: i64,
     pub error_count: i64,
+    /// Set during the cheap pre-walk count phase; `None` until then.
+    /// Used to derive `progress_percent` in the `ScanStatus` DTO.
+    pub estimated_total_count: Option<i64>,
+    /// Most recent path the scanner emitted progress for. Populated lazily
+    /// during the main walk; `None` while the count phase is running.
+    pub current_path: Option<String>,
     pub started_at: String,
     pub finished_at: Option<String>,
     pub error_message: Option<String>,

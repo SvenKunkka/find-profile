@@ -74,6 +74,7 @@ pub fn run() {
             commands::remove_index_root,
             commands::rescan_root,
             commands::cancel_scan,
+            commands::start_scan_all_roots,
             commands::get_settings,
             commands::update_settings,
             commands::get_app_paths,
