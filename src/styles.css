@@ -287,6 +287,119 @@ body {
   margin-top: 4px;
 }
 
+/* ---------- filter toolbar / pagination / empty help ---------- */
+
+.filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 12px;
+  border-bottom: 1px solid #e5e5ea;
+  background: #ffffff;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+}
+
+.filter-field {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: #3a3a3c;
+  white-space: nowrap;
+}
+
+.filter-field > span {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 500;
+  color: #6e6e73;
+  font-size: 10px;
+}
+
+.filter-field input[type="text"],
+.filter-field select {
+  font: inherit;
+  font-size: 12px;
+  padding: 2px 6px;
+  border: 1px solid #c7c7cc;
+  border-radius: 3px;
+  background: #ffffff;
+  color: #1c1c1e;
+}
+
+.filter-field input[type="text"] {
+  min-width: 160px;
+}
+
+.filter-field input[type="text"]:focus,
+.filter-field select:focus {
+  outline: none;
+  border-color: #0a84ff;
+  box-shadow: 0 0 0 2px rgba(10, 132, 255, 0.2);
+}
+
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 4px 12px;
+  border-top: 1px solid #e5e5ea;
+  background: #f9f9fb;
+  flex: 0 0 auto;
+  font-size: 11px;
+}
+
+.pagination button {
+  font: inherit;
+  font-size: 11px;
+  padding: 2px 8px;
+  border: 1px solid #c7c7cc;
+  border-radius: 3px;
+  background: #ffffff;
+  color: #1c1c1e;
+  cursor: pointer;
+}
+
+.pagination button:hover:not(:disabled) {
+  border-color: #0a84ff;
+  background: #f0f0f3;
+}
+
+.pagination button:disabled {
+  color: #8e8e93;
+  cursor: not-allowed;
+}
+
+.pagination-page {
+  color: #6e6e73;
+  font-variant-numeric: tabular-nums;
+}
+
+.empty-help {
+  padding: 24px;
+  color: #3a3a3c;
+  line-height: 1.6;
+}
+
+.empty-help p {
+  margin: 0 0 8px 0;
+}
+
+.empty-help ul {
+  margin: 4px 0 0 0;
+  padding-left: 20px;
+}
+
+.empty-help li {
+  margin-bottom: 2px;
+}
+
+.empty-help strong {
+  color: #1c1c1e;
+}
+
 /* ---------- results table ---------- */
 
 .results-table-wrap {
@@ -517,6 +630,48 @@ body {
   .status-label,
   .roots-hints {
     color: #8e8e93;
+  }
+  .filter-bar {
+    background: #1c1c1e;
+    border-color: #3a3a3c;
+  }
+  .filter-field {
+    color: #d1d1d6;
+  }
+  .filter-field > span {
+    color: #8e8e93;
+  }
+  .filter-field input[type="text"],
+  .filter-field select {
+    background: #2c2c2e;
+    color: #f2f2f7;
+    border-color: #3a3a3c;
+  }
+  .filter-field input[type="text"]:focus,
+  .filter-field select:focus {
+    border-color: #0a84ff;
+  }
+  .pagination {
+    background: #2c2c2e;
+    border-color: #3a3a3c;
+  }
+  .pagination button {
+    background: #2c2c2e;
+    color: #f2f2f7;
+    border-color: #3a3a3c;
+  }
+  .pagination button:hover:not(:disabled) {
+    background: #3a3a3c;
+    border-color: #0a84ff;
+  }
+  .pagination-page {
+    color: #8e8e93;
+  }
+  .empty-help {
+    color: #d1d1d6;
+  }
+  .empty-help strong {
+    color: #f2f2f7;
   }
   .roots-hints {
     background: #2c2c2e;

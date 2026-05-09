@@ -1,9 +1,12 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 
 type RootKind = "local" | "nas";
 type RootStatus = "available" | "disconnected" | "scanning" | "error";
+type SourceFilter = "all" | "local" | "nas";
+type TypeFilter = "all" | "files" | "dirs";
+type SortBy = "relevance" | "modified" | "size" | "name";
 
 interface Root {
   id: number;
@@ -49,7 +52,7 @@ interface CommandError {
 }
 
 const SEARCH_DEBOUNCE_MS = 200;
-const SEARCH_LIMIT = 200;
+const PAGE_SIZE = 50;
 const SCAN_POLL_MS = 1500;
 const SCAN_POLL_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -85,10 +88,6 @@ function formatSize(bytes: number | null, isDir: boolean): string {
 }
 
 function accessibilityLabel(hit: FileHit): string {
-  // A NAS root that's disconnected (or any root in error state) makes its
-  // cached files unreachable right now even if `is_accessible` was true at
-  // scan time. Surface that as `unavailable` so users don't think a stale
-  // entry is openable.
   if (hit.root_status === "disconnected" || hit.root_status === "error") {
     return "unavailable";
   }
@@ -114,6 +113,20 @@ function formatModified(iso: string | null): string {
   )}:${pad(d.getMinutes())}`;
 }
 
+function parseExtensionInput(input: string): string[] {
+  // Split on comma OR whitespace; strip leading dots; lowercase; dedupe.
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of input.split(/[,\s]+/)) {
+    const cleaned = raw.trim().replace(/^\./, "").toLowerCase();
+    if (cleaned.length > 0 && !seen.has(cleaned)) {
+      seen.add(cleaned);
+      out.push(cleaned);
+    }
+  }
+  return out;
+}
+
 function App() {
   const [roots, setRoots] = useState<Root[]>([]);
   const [query, setQuery] = useState("");
@@ -123,7 +136,24 @@ function App() {
   const [currentPath, setCurrentPath] = useState<string | null>(null);
   const [searched, setSearched] = useState(false);
 
+  // Filters / sort / pagination.
+  const [extensionInput, setExtensionInput] = useState("");
+  const [sourceFilter, setSourceFilter] = useState<SourceFilter>("all");
+  const [typeFilter, setTypeFilter] = useState<TypeFilter>("all");
+  const [sortBy, setSortBy] = useState<SortBy>("relevance");
+  const [page, setPage] = useState(0);
+
   const searchTimer = useRef<number | null>(null);
+
+  const extensions = useMemo(
+    () => parseExtensionInput(extensionInput),
+    [extensionInput]
+  );
+
+  // Reset to page 0 whenever the *content* of the result list might change.
+  useEffect(() => {
+    setPage(0);
+  }, [query, extensionInput, sourceFilter, typeFilter, sortBy]);
 
   async function refreshRoots() {
     try {
@@ -138,12 +168,11 @@ function App() {
     }
   }
 
-  // Initial load: never blocks initial render.
   useEffect(() => {
     void refreshRoots();
   }, []);
 
-  // Debounced search.
+  // Debounced search. Re-runs on any filter / sort / page change.
   useEffect(() => {
     if (searchTimer.current !== null) {
       window.clearTimeout(searchTimer.current);
@@ -161,8 +190,12 @@ function App() {
         try {
           const hits = await invoke<FileHit[]>("search_files", {
             query: trimmed,
-            limit: SEARCH_LIMIT,
-            offset: 0,
+            limit: PAGE_SIZE,
+            offset: page * PAGE_SIZE,
+            extensions: extensions.length > 0 ? extensions : null,
+            source: sourceFilter === "all" ? null : sourceFilter,
+            typeFilter: typeFilter === "all" ? null : typeFilter,
+            sort: sortBy,
           });
           if (!cancelled) {
             setResults(hits);
@@ -183,7 +216,7 @@ function App() {
         searchTimer.current = null;
       }
     };
-  }, [query]);
+  }, [query, extensions, sourceFilter, typeFilter, sortBy, page]);
 
   async function handleAddRoot() {
     console.log("add root clicked");
@@ -202,7 +235,7 @@ function App() {
     console.log("selected root", selected);
 
     if (selected === null || selected === undefined) {
-      return; // user cancelled
+      return;
     }
     const path = Array.isArray(selected) ? selected[0] : selected;
     if (typeof path !== "string" || path.length === 0) {
@@ -224,9 +257,6 @@ function App() {
       await invoke("start_scan", { rootId });
       await refreshRoots();
 
-      // Light polling: scanner flips status to Scanning at start and back to
-      // Available on finish. We refresh until the scan_job for this root is
-      // no longer running, with a hard ceiling so we never poll forever.
       const start = Date.now();
       const tick = window.setInterval(() => {
         (async () => {
@@ -271,10 +301,16 @@ function App() {
     }
   }
 
+  const trimmedQuery = query.trim();
+  const hasQuery = trimmedQuery.length > 0;
+  const isFirstPage = page === 0;
+  const hasNextPage = results.length === PAGE_SIZE;
+
   const resultCountLabel = (() => {
-    if (query.trim().length === 0) return "";
+    if (!hasQuery) return "";
     if (!searched) return "…";
-    return `${results.length} result${results.length === 1 ? "" : "s"}`;
+    if (results.length === 0) return "0 results";
+    return `${results.length} on page ${page + 1}`;
   })();
 
   return (
@@ -352,81 +388,187 @@ function App() {
           <div className="panel-header">
             <h2 className="panel-title">Results</h2>
           </div>
-          {results.length === 0 ? (
-            <div className="panel-empty">No results.</div>
-          ) : (
-            <div className="results-table-wrap">
-              <table className="results-table">
-                <colgroup>
-                  <col className="col-name" />
-                  <col className="col-path" />
-                  <col className="col-ext" />
-                  <col className="col-size" />
-                  <col className="col-modified" />
-                  <col className="col-kind" />
-                  <col className="col-source" />
-                  <col className="col-access" />
-                  <col className="col-actions" />
-                </colgroup>
-                <thead>
-                  <tr>
-                    <th>Name</th>
-                    <th>Path</th>
-                    <th>Extension</th>
-                    <th className="num">Size</th>
-                    <th>Modified</th>
-                    <th>Kind</th>
-                    <th>Source</th>
-                    <th>Accessible</th>
-                    <th aria-label="Actions"></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {results.map((hit) => (
-                    <tr
-                      key={hit.id}
-                      className={`result-row ${
-                        currentPath === hit.path ? "is-selected" : ""
-                      }`}
-                      onClick={() => setCurrentPath(hit.path)}
-                      onDoubleClick={() => void handleOpen(hit.path)}
-                      title={hit.path}
-                    >
-                      <td className="cell-name">{hit.name}</td>
-                      <td className="cell-path">{hit.path}</td>
-                      <td>{hit.extension ?? "—"}</td>
-                      <td className="num">
-                        {formatSize(hit.size, hit.is_dir)}
-                      </td>
-                      <td>{formatModified(hit.modified_at)}</td>
-                      <td>{hit.is_dir ? "folder" : "file"}</td>
-                      <td>
-                        <span
-                          className={`root-kind kind-${hit.source_kind}`}
-                        >
-                          {hit.source_kind}
-                        </span>
-                      </td>
-                      <td className={accessibilityClass(hit)}>
-                        {accessibilityLabel(hit)}
-                      </td>
-                      <td className="cell-actions">
-                        <button
-                          type="button"
-                          className="btn-reveal"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            void handleReveal(hit.path);
-                          }}
-                        >
-                          Reveal
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+
+          <div className="filter-bar" role="toolbar" aria-label="Search filters">
+            <label className="filter-field">
+              <span>Ext</span>
+              <input
+                type="text"
+                value={extensionInput}
+                onChange={(e) => setExtensionInput(e.target.value)}
+                placeholder="pdf, txt, jpg"
+                aria-label="Filter by extension"
+              />
+            </label>
+            <label className="filter-field">
+              <span>Source</span>
+              <select
+                value={sourceFilter}
+                onChange={(e) =>
+                  setSourceFilter(e.target.value as SourceFilter)
+                }
+                aria-label="Filter by source"
+              >
+                <option value="all">All</option>
+                <option value="local">Local</option>
+                <option value="nas">NAS</option>
+              </select>
+            </label>
+            <label className="filter-field">
+              <span>Type</span>
+              <select
+                value={typeFilter}
+                onChange={(e) => setTypeFilter(e.target.value as TypeFilter)}
+                aria-label="Filter by type"
+              >
+                <option value="all">All</option>
+                <option value="files">Files</option>
+                <option value="dirs">Folders</option>
+              </select>
+            </label>
+            <label className="filter-field">
+              <span>Sort</span>
+              <select
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value as SortBy)}
+                aria-label="Sort by"
+              >
+                <option value="relevance">Relevance</option>
+                <option value="modified">Modified</option>
+                <option value="size">Size</option>
+                <option value="name">Name</option>
+              </select>
+            </label>
+          </div>
+
+          {!hasQuery ? (
+            <div className="panel-empty empty-help" role="status">
+              <p>
+                <strong>Type to search</strong> indexed files by name or path.
+              </p>
+              <p>
+                Add a root in the left panel and click <em>Scan</em> to populate
+                the index. Filenames rank above path matches.
+              </p>
             </div>
+          ) : !searched ? (
+            <div className="panel-empty empty-help">Searching…</div>
+          ) : results.length === 0 ? (
+            <div className="panel-empty empty-help" role="status">
+              <p>
+                No matches for <strong>"{trimmedQuery}"</strong>
+                {extensions.length > 0
+                  ? ` (extensions: ${extensions.join(", ")})`
+                  : ""}
+                {sourceFilter !== "all" ? ` · source: ${sourceFilter}` : ""}
+                {typeFilter !== "all" ? ` · type: ${typeFilter}` : ""}
+                .
+              </p>
+              <ul>
+                <li>Try a shorter or different keyword.</li>
+                <li>Check the spelling.</li>
+                <li>Loosen the filters above (Ext / Source / Type).</li>
+                <li>
+                  Confirm the file's root is added and scanned in the left
+                  panel.
+                </li>
+              </ul>
+            </div>
+          ) : (
+            <>
+              <div className="results-table-wrap">
+                <table className="results-table">
+                  <colgroup>
+                    <col className="col-name" />
+                    <col className="col-path" />
+                    <col className="col-ext" />
+                    <col className="col-size" />
+                    <col className="col-modified" />
+                    <col className="col-kind" />
+                    <col className="col-source" />
+                    <col className="col-access" />
+                    <col className="col-actions" />
+                  </colgroup>
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Path</th>
+                      <th>Extension</th>
+                      <th className="num">Size</th>
+                      <th>Modified</th>
+                      <th>Kind</th>
+                      <th>Source</th>
+                      <th>Accessible</th>
+                      <th aria-label="Actions"></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {results.map((hit) => (
+                      <tr
+                        key={hit.id}
+                        className={`result-row ${
+                          currentPath === hit.path ? "is-selected" : ""
+                        }`}
+                        onClick={() => setCurrentPath(hit.path)}
+                        onDoubleClick={() => void handleOpen(hit.path)}
+                        title={hit.path}
+                      >
+                        <td className="cell-name">{hit.name}</td>
+                        <td className="cell-path">{hit.path}</td>
+                        <td>{hit.extension ?? "—"}</td>
+                        <td className="num">
+                          {formatSize(hit.size, hit.is_dir)}
+                        </td>
+                        <td>{formatModified(hit.modified_at)}</td>
+                        <td>{hit.is_dir ? "folder" : "file"}</td>
+                        <td>
+                          <span
+                            className={`root-kind kind-${hit.source_kind}`}
+                          >
+                            {hit.source_kind}
+                          </span>
+                        </td>
+                        <td className={accessibilityClass(hit)}>
+                          {accessibilityLabel(hit)}
+                        </td>
+                        <td className="cell-actions">
+                          <button
+                            type="button"
+                            className="btn-reveal"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void handleReveal(hit.path);
+                            }}
+                          >
+                            Reveal
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="pagination" aria-label="Pagination">
+                <button
+                  type="button"
+                  onClick={() => setPage((p) => Math.max(0, p - 1))}
+                  disabled={isFirstPage}
+                >
+                  ← Prev
+                </button>
+                <span className="pagination-page">
+                  Page {page + 1}
+                  {hasNextPage ? "" : " · end"}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setPage((p) => p + 1)}
+                  disabled={!hasNextPage}
+                >
+                  Next →
+                </button>
+              </div>
+            </>
           )}
         </section>
       </main>
@@ -436,8 +578,10 @@ function App() {
           <span className="status-label">Status</span>
           <span className="status-value">
             Ready · {roots.length} root{roots.length === 1 ? "" : "s"}
-            {results.length > 0
-              ? ` · ${results.length} hit${results.length === 1 ? "" : "s"}`
+            {hasQuery && searched
+              ? ` · page ${page + 1}: ${results.length} hit${
+                  results.length === 1 ? "" : "s"
+                }`
               : ""}
           </span>
         </div>

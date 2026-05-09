@@ -12,7 +12,8 @@ use rusqlite::Connection;
 
 pub use error::{DbError, Result};
 pub use files::{
-    begin_index_transaction, remove_file, search_files, upsert_file, upsert_file_in_transaction,
+    begin_index_transaction, remove_file, search_files, search_files_with_options, upsert_file,
+    upsert_file_in_transaction, SearchOptions, SortBy,
 };
 pub use model::{
     EnumParseError, FileHit, FileMetadata, Root, RootKind, RootStatus, ScanJob, ScanJobStatus,
@@ -519,6 +520,318 @@ mod tests {
             none.is_none(),
             "prefix-without-slash must not be treated as a parent"
         );
+    }
+
+    fn meta_with(
+        root_id: i64,
+        path: &str,
+        name: &str,
+        is_dir: bool,
+        size: Option<i64>,
+        modified_at: Option<&str>,
+        source_kind: RootKind,
+    ) -> FileMetadata {
+        FileMetadata {
+            root_id,
+            path: path.to_string(),
+            name: name.to_string(),
+            extension: if is_dir {
+                None
+            } else {
+                name.rsplit_once('.').map(|(_, e)| e.to_lowercase())
+            },
+            size,
+            modified_at: modified_at.map(|s| s.to_string()),
+            is_dir,
+            source_kind,
+            is_accessible: true,
+        }
+    }
+
+    #[test]
+    fn search_options_relevance_prefers_name_over_path() {
+        let conn = init_in_memory_db().unwrap();
+        let r = add_root(&conn, "/a", RootKind::Local).unwrap();
+
+        // File 1: "kw" appears only in the path tokens, not in the name.
+        upsert_file(
+            &conn,
+            &meta(r.id, "/a/kw/other.txt", "other.txt"),
+        )
+        .unwrap();
+        // File 2: "kw" appears in both the name and the path.
+        upsert_file(&conn, &meta(r.id, "/a/x/kw.txt", "kw.txt")).unwrap();
+
+        let opts = SearchOptions::simple("kw", 10, 0);
+        let hits = search_files_with_options(&conn, &opts).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits[0].name, "kw.txt",
+            "BM25 weighting must rank file with name match above path-only match"
+        );
+    }
+
+    #[test]
+    fn search_options_filter_by_extension() {
+        let conn = init_in_memory_db().unwrap();
+        let r = add_root(&conn, "/a", RootKind::Local).unwrap();
+        upsert_file(&conn, &meta(r.id, "/a/foo.pdf", "foo.pdf")).unwrap();
+        upsert_file(&conn, &meta(r.id, "/a/foo.txt", "foo.txt")).unwrap();
+        upsert_file(&conn, &meta(r.id, "/a/foo.md", "foo.md")).unwrap();
+
+        let mut opts = SearchOptions::simple("foo", 10, 0);
+        opts.extensions = vec!["pdf".into()];
+        let hits = search_files_with_options(&conn, &opts).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].extension.as_deref(), Some("pdf"));
+
+        opts.extensions = vec!["pdf".into(), "md".into()];
+        let multi = search_files_with_options(&conn, &opts).unwrap();
+        assert_eq!(multi.len(), 2);
+    }
+
+    #[test]
+    fn search_options_extension_filter_strips_leading_dot_and_lowercases() {
+        let conn = init_in_memory_db().unwrap();
+        let r = add_root(&conn, "/a", RootKind::Local).unwrap();
+        upsert_file(&conn, &meta(r.id, "/a/foo.pdf", "foo.pdf")).unwrap();
+
+        let mut opts = SearchOptions::simple("foo", 10, 0);
+        opts.extensions = vec![".PDF".into()];
+        let hits = search_files_with_options(&conn, &opts).unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn search_options_filter_by_source() {
+        let conn = init_in_memory_db().unwrap();
+        let local = add_root(&conn, "/a", RootKind::Local).unwrap();
+        let nas = add_root(&conn, "/Volumes/B", RootKind::Nas).unwrap();
+        upsert_file(
+            &conn,
+            &meta_with(
+                local.id,
+                "/a/note.txt",
+                "note.txt",
+                false,
+                Some(10),
+                None,
+                RootKind::Local,
+            ),
+        )
+        .unwrap();
+        upsert_file(
+            &conn,
+            &meta_with(
+                nas.id,
+                "/Volumes/B/note.txt",
+                "note.txt",
+                false,
+                Some(20),
+                None,
+                RootKind::Nas,
+            ),
+        )
+        .unwrap();
+
+        let mut opts = SearchOptions::simple("note", 10, 0);
+        opts.source = Some(RootKind::Local);
+        let local_only = search_files_with_options(&conn, &opts).unwrap();
+        assert_eq!(local_only.len(), 1);
+        assert_eq!(local_only[0].source_kind, RootKind::Local);
+
+        opts.source = Some(RootKind::Nas);
+        let nas_only = search_files_with_options(&conn, &opts).unwrap();
+        assert_eq!(nas_only.len(), 1);
+        assert_eq!(nas_only[0].source_kind, RootKind::Nas);
+
+        opts.source = None;
+        let all = search_files_with_options(&conn, &opts).unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn search_options_filter_files_only_or_dirs_only() {
+        let conn = init_in_memory_db().unwrap();
+        let r = add_root(&conn, "/a", RootKind::Local).unwrap();
+        upsert_file(
+            &conn,
+            &meta_with(r.id, "/a/notes", "notes", true, None, None, RootKind::Local),
+        )
+        .unwrap();
+        upsert_file(
+            &conn,
+            &meta_with(
+                r.id,
+                "/a/notes.txt",
+                "notes.txt",
+                false,
+                Some(1),
+                None,
+                RootKind::Local,
+            ),
+        )
+        .unwrap();
+
+        let mut opts = SearchOptions::simple("notes", 10, 0);
+        opts.is_dir_filter = Some(false);
+        let files = search_files_with_options(&conn, &opts).unwrap();
+        assert!(files.iter().all(|h| !h.is_dir));
+        assert!(files.iter().any(|h| h.name == "notes.txt"));
+
+        opts.is_dir_filter = Some(true);
+        let dirs = search_files_with_options(&conn, &opts).unwrap();
+        assert!(dirs.iter().all(|h| h.is_dir));
+        assert!(dirs.iter().any(|h| h.name == "notes"));
+    }
+
+    #[test]
+    fn search_options_sort_by_name_alphabetical() {
+        let conn = init_in_memory_db().unwrap();
+        let r = add_root(&conn, "/a", RootKind::Local).unwrap();
+        upsert_file(&conn, &meta(r.id, "/a/charlie.txt", "charlie.txt")).unwrap();
+        upsert_file(&conn, &meta(r.id, "/a/Alpha.txt", "Alpha.txt")).unwrap();
+        upsert_file(&conn, &meta(r.id, "/a/bravo.txt", "bravo.txt")).unwrap();
+
+        let mut opts = SearchOptions::simple("txt", 10, 0);
+        opts.sort = SortBy::Name;
+        let hits = search_files_with_options(&conn, &opts).unwrap();
+        let names: Vec<_> = hits.iter().map(|h| h.name.as_str()).collect();
+        // COLLATE NOCASE: A < b < c regardless of case
+        assert_eq!(names, vec!["Alpha.txt", "bravo.txt", "charlie.txt"]);
+    }
+
+    #[test]
+    fn search_options_sort_by_modified_desc_with_nulls_last() {
+        let conn = init_in_memory_db().unwrap();
+        let r = add_root(&conn, "/a", RootKind::Local).unwrap();
+        upsert_file(
+            &conn,
+            &meta_with(
+                r.id,
+                "/a/old.txt",
+                "old.txt",
+                false,
+                Some(1),
+                Some("2020-01-01T00:00:00Z"),
+                RootKind::Local,
+            ),
+        )
+        .unwrap();
+        upsert_file(
+            &conn,
+            &meta_with(
+                r.id,
+                "/a/new.txt",
+                "new.txt",
+                false,
+                Some(1),
+                Some("2026-05-09T00:00:00Z"),
+                RootKind::Local,
+            ),
+        )
+        .unwrap();
+        upsert_file(
+            &conn,
+            &meta_with(
+                r.id,
+                "/a/null.txt",
+                "null.txt",
+                false,
+                Some(1),
+                None,
+                RootKind::Local,
+            ),
+        )
+        .unwrap();
+
+        let mut opts = SearchOptions::simple("txt", 10, 0);
+        opts.sort = SortBy::Modified;
+        let hits = search_files_with_options(&conn, &opts).unwrap();
+        let names: Vec<_> = hits.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, vec!["new.txt", "old.txt", "null.txt"]);
+    }
+
+    #[test]
+    fn search_options_sort_by_size_desc() {
+        let conn = init_in_memory_db().unwrap();
+        let r = add_root(&conn, "/a", RootKind::Local).unwrap();
+        upsert_file(
+            &conn,
+            &meta_with(
+                r.id,
+                "/a/small.txt",
+                "small.txt",
+                false,
+                Some(10),
+                None,
+                RootKind::Local,
+            ),
+        )
+        .unwrap();
+        upsert_file(
+            &conn,
+            &meta_with(
+                r.id,
+                "/a/big.txt",
+                "big.txt",
+                false,
+                Some(1024),
+                None,
+                RootKind::Local,
+            ),
+        )
+        .unwrap();
+        upsert_file(
+            &conn,
+            &meta_with(
+                r.id,
+                "/a/medium.txt",
+                "medium.txt",
+                false,
+                Some(100),
+                None,
+                RootKind::Local,
+            ),
+        )
+        .unwrap();
+
+        let mut opts = SearchOptions::simple("txt", 10, 0);
+        opts.sort = SortBy::Size;
+        let hits = search_files_with_options(&conn, &opts).unwrap();
+        let names: Vec<_> = hits.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, vec!["big.txt", "medium.txt", "small.txt"]);
+    }
+
+    #[test]
+    fn search_options_combines_filter_with_pagination() {
+        let conn = init_in_memory_db().unwrap();
+        let r = add_root(&conn, "/a", RootKind::Local).unwrap();
+        for i in 0..7 {
+            let p = format!("/a/note{i}.pdf");
+            let n = format!("note{i}.pdf");
+            upsert_file(&conn, &meta(r.id, &p, &n)).unwrap();
+        }
+        upsert_file(&conn, &meta(r.id, "/a/note0.txt", "note0.txt")).unwrap();
+
+        let mut opts = SearchOptions::simple("note", 3, 0);
+        opts.extensions = vec!["pdf".into()];
+        opts.sort = SortBy::Name;
+        let page0 = search_files_with_options(&conn, &opts).unwrap();
+        assert_eq!(page0.len(), 3);
+
+        opts.offset = 3;
+        let page1 = search_files_with_options(&conn, &opts).unwrap();
+        assert_eq!(page1.len(), 3);
+
+        opts.offset = 6;
+        let page2 = search_files_with_options(&conn, &opts).unwrap();
+        assert_eq!(page2.len(), 1);
+
+        // No overlap between pages.
+        let p0_ids: Vec<i64> = page0.iter().map(|h| h.id).collect();
+        let p1_ids: Vec<i64> = page1.iter().map(|h| h.id).collect();
+        assert!(p0_ids.iter().all(|id| !p1_ids.contains(id)));
     }
 
     #[test]

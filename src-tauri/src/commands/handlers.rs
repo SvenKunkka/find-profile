@@ -5,7 +5,7 @@ use std::sync::MutexGuard;
 use rusqlite::Connection;
 use tauri::State;
 
-use crate::db::{self, FileHit, Root, RootKind, RootStatus, ScanJob};
+use crate::db::{self, FileHit, Root, RootKind, RootStatus, ScanJob, SearchOptions, SortBy};
 use crate::roots::register_root;
 use crate::scanner::{self, ScanInput};
 
@@ -115,16 +115,71 @@ pub fn get_scan_status(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn search_files(
     state: State<'_, AppState>,
     query: String,
     limit: i64,
     offset: i64,
+    extensions: Option<Vec<String>>,
+    source: Option<String>,
+    type_filter: Option<String>,
+    sort: Option<String>,
 ) -> CommandResult<Vec<FileHit>> {
     let limit = limit.clamp(1, SEARCH_LIMIT_MAX);
     let offset = offset.max(0);
+
+    let source_kind = match source.as_deref() {
+        None | Some("") | Some("all") => None,
+        Some(s) => Some(RootKind::parse(s).ok_or_else(|| {
+            CommandError::new("invalid_source", format!("invalid source filter: {s}"))
+        })?),
+    };
+
+    let is_dir_filter = match type_filter.as_deref() {
+        None | Some("") | Some("all") => None,
+        Some("files") => Some(false),
+        Some("dirs") | Some("folders") => Some(true),
+        Some(other) => {
+            return Err(CommandError::new(
+                "invalid_type_filter",
+                format!("invalid type filter: {other}"),
+            ))
+        }
+    };
+
+    let sort_by = match sort.as_deref() {
+        None | Some("") | Some("relevance") => SortBy::Relevance,
+        Some("modified") => SortBy::Modified,
+        Some("size") => SortBy::Size,
+        Some("name") => SortBy::Name,
+        Some(other) => {
+            return Err(CommandError::new(
+                "invalid_sort",
+                format!("invalid sort: {other}"),
+            ))
+        }
+    };
+
+    let extensions = extensions
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| e.trim().trim_start_matches('.').to_lowercase())
+        .filter(|e| !e.is_empty())
+        .collect::<Vec<_>>();
+
+    let options = SearchOptions {
+        query,
+        limit,
+        offset,
+        extensions,
+        source: source_kind,
+        is_dir_filter,
+        sort: sort_by,
+    };
+
     let conn = lock_conn(&state)?;
-    Ok(db::search_files(&conn, &query, limit, offset)?)
+    Ok(db::search_files_with_options(&conn, &options)?)
 }
 
 #[tauri::command]
