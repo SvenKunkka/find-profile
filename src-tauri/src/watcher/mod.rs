@@ -55,30 +55,21 @@ impl WatcherRegistry {
             handle_event(res, root_id, source_kind, &handler_conn);
         })?;
         watcher.watch(Path::new(&root.path), RecursiveMode::Recursive)?;
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|_| WatcherError::PoisonedLock)?;
+        let mut guard = self.inner.lock().map_err(|_| WatcherError::PoisonedLock)?;
         guard.insert(root_id, watcher);
         Ok(true)
     }
 
     /// Stop watching a root. Idempotent — calling on an unknown id is a no-op.
     pub fn stop(&self, root_id: i64) -> Result<()> {
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|_| WatcherError::PoisonedLock)?;
+        let mut guard = self.inner.lock().map_err(|_| WatcherError::PoisonedLock)?;
         guard.remove(&root_id);
         Ok(())
     }
 
     /// Number of currently active watchers. Mainly useful for tests.
     pub fn active_count(&self) -> Result<usize> {
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|_| WatcherError::PoisonedLock)?;
+        let guard = self.inner.lock().map_err(|_| WatcherError::PoisonedLock)?;
         Ok(guard.len())
     }
 
@@ -89,9 +80,7 @@ impl WatcherRegistry {
     /// block startup. Returns the number of watchers successfully started.
     pub fn restore_all(&self, conn: Arc<Mutex<Connection>>) -> Result<usize> {
         let roots = {
-            let conn_guard = conn
-                .lock()
-                .map_err(|_| WatcherError::PoisonedLock)?;
+            let conn_guard = conn.lock().map_err(|_| WatcherError::PoisonedLock)?;
             db::list_roots(&conn_guard)?
         };
 
@@ -155,11 +144,7 @@ mod tests {
         Arc::new(Mutex::new(init_in_memory_db().unwrap()))
     }
 
-    fn add_root(
-        conn_arc: &Arc<Mutex<Connection>>,
-        path: &str,
-        kind: &str,
-    ) -> Root {
+    fn add_root(conn_arc: &Arc<Mutex<Connection>>, path: &str, kind: &str) -> Root {
         let conn = conn_arc.lock().unwrap();
         register_root(&conn, path, Some(kind)).unwrap()
     }
@@ -167,7 +152,12 @@ mod tests {
     /// Poll an in-memory DB for a search hit until `deadline`. Returns true
     /// when the predicate is satisfied. Used to absorb the FSEvents / inotify
     /// dispatch latency without sleeping a fixed (potentially-flaky) amount.
-    fn wait_for<F>(conn_arc: &Arc<Mutex<Connection>>, query: &str, deadline: Instant, mut f: F) -> bool
+    fn wait_for<F>(
+        conn_arc: &Arc<Mutex<Connection>>,
+        query: &str,
+        deadline: Instant,
+        mut f: F,
+    ) -> bool
     where
         F: FnMut(&[crate::db::FileHit]) -> bool,
     {
@@ -299,6 +289,7 @@ mod tests {
                     extension: Some("txt".to_string()),
                     size: Some(1),
                     modified_at: None,
+                    added_at: None,
                     is_dir: false,
                     source_kind: RootKind::Local,
                     is_accessible: true,
@@ -321,7 +312,10 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(8);
         let gone = wait_for(&conn_arc, "doomed", deadline, |hits| hits.is_empty());
-        assert!(gone, "watcher must remove deleted file from index within 8s");
+        assert!(
+            gone,
+            "watcher must remove deleted file from index within 8s"
+        );
 
         registry.stop(root.id).unwrap();
         cleanup(&dir);
@@ -344,6 +338,7 @@ mod tests {
                     extension: Some("txt".to_string()),
                     size: Some(1),
                     modified_at: None,
+                    added_at: None,
                     is_dir: false,
                     source_kind: RootKind::Local,
                     is_accessible: true,
@@ -370,7 +365,10 @@ mod tests {
         let before_gone = wait_for(&conn_arc, "before", deadline2, |hits| {
             !hits.iter().any(|h| h.name == "before.txt")
         });
-        assert!(before_gone, "watcher must drop old name (before.txt) after rename");
+        assert!(
+            before_gone,
+            "watcher must drop old name (before.txt) after rename"
+        );
 
         registry.stop(root.id).unwrap();
         cleanup(&dir);

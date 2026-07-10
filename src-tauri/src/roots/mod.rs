@@ -18,11 +18,7 @@ pub use kind::{parse_kind, resolve_kind};
 /// Initial status is left at the db-layer default (`available`); accessibility
 /// is decided lazily by `refresh_root_status` so that adding a NAS root while
 /// the volume is unmounted doesn't fail outright.
-pub fn register_root(
-    conn: &Connection,
-    path: &str,
-    user_kind: Option<&str>,
-) -> Result<Root> {
+pub fn register_root(conn: &Connection, path: &str, user_kind: Option<&str>) -> Result<Root> {
     let kind = resolve_kind(path, user_kind)?;
     let root = db::add_root(conn, path, kind)?;
     Ok(root)
@@ -67,6 +63,7 @@ mod tests {
             extension: None,
             size: Some(1),
             modified_at: None,
+            added_at: None,
             is_dir: false,
             source_kind: kind,
             is_accessible: true,

@@ -16,8 +16,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use super::*;
     use super::handlers::{check_root_reachable, scan_all_roots_inner, ScanStatus};
+    use super::*;
     use crate::db::{
         add_root, create_scan_job, finish_scan_job, init_in_memory_db, list_roots,
         update_root_status, update_scan_job_estimated_total, update_scan_job_progress, DbError,
@@ -281,7 +281,10 @@ mod tests {
 
         let state = AppState::new(conn);
         let spawned = scan_all_roots_inner(&state).unwrap();
-        assert_eq!(spawned, 2, "both spawns are issued; failures happen in workers");
+        assert_eq!(
+            spawned, 2,
+            "both spawns are issued; failures happen in workers"
+        );
 
         let conn_arc = state.conn.clone();
         let real_ok = wait_for_status(
@@ -290,7 +293,10 @@ mod tests {
             RootStatus::Available,
             Instant::now() + Duration::from_secs(5),
         );
-        assert!(real_ok, "real root should still complete despite bogus root failure");
+        assert!(
+            real_ok,
+            "real root should still complete despite bogus root failure"
+        );
 
         let bogus_ok = wait_for_status(
             &conn_arc,

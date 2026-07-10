@@ -18,8 +18,7 @@ pub fn run() {
             // ---- file logging --------------------------------------------------
             let log_dir = app.path().app_log_dir()?;
             std::fs::create_dir_all(&log_dir)?;
-            let appender =
-                tracing_appender::rolling::daily(&log_dir, "find_profile.log");
+            let appender = tracing_appender::rolling::daily(&log_dir, "find_profile.log");
             let (writer, guard) = tracing_appender::non_blocking(appender);
             // The non-blocking writer's worker thread is kept alive by `guard`;
             // intentionally leak it so it lives for the full app lifetime
@@ -43,6 +42,11 @@ pub fn run() {
             let db_path = app_data_dir.join("find_profile.db");
             tracing::info!(db_path = %db_path.display(), "initializing database");
             let conn = db::init_db(&db_path)?;
+            match db::cleanup_interrupted_scans(&conn) {
+                Ok(n) if n > 0 => tracing::warn!(count = n, "cleaned interrupted scans"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "failed to clean interrupted scans"),
+            }
 
             // ---- settings ------------------------------------------------------
             let app_settings = settings::load(&conn).unwrap_or_default();
@@ -61,6 +65,10 @@ pub fn run() {
             }
 
             app.manage(state);
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -71,6 +79,7 @@ pub fn run() {
             commands::search_files,
             commands::open_file,
             commands::reveal_in_finder,
+            commands::jump_to_path,
             commands::remove_index_root,
             commands::rescan_root,
             commands::cancel_scan,
@@ -82,6 +91,25 @@ pub fn run() {
             commands::rebuild_index,
             commands::open_log_dir,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            if matches!(event, tauri::RunEvent::Ready) {
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen {
+                has_visible_windows: false,
+                ..
+            } = event
+            {
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+        });
 }

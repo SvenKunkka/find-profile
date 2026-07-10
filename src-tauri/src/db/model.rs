@@ -40,9 +40,8 @@ impl RootKind {
 impl FromSql for RootKind {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
         let s = value.as_str()?;
-        Self::parse(s).ok_or_else(|| {
-            FromSqlError::Other(Box::new(EnumParseError(format!("RootKind: {s}"))))
-        })
+        Self::parse(s)
+            .ok_or_else(|| FromSqlError::Other(Box::new(EnumParseError(format!("RootKind: {s}")))))
     }
 }
 
@@ -163,6 +162,7 @@ pub struct FileMetadata {
     pub extension: Option<String>,
     pub size: Option<i64>,
     pub modified_at: Option<String>,
+    pub added_at: Option<String>,
     pub is_dir: bool,
     pub source_kind: RootKind,
     pub is_accessible: bool,
@@ -177,6 +177,7 @@ pub struct FileHit {
     pub extension: Option<String>,
     pub size: Option<i64>,
     pub modified_at: Option<String>,
+    pub added_at: Option<String>,
     pub is_dir: bool,
     pub source_kind: RootKind,
     pub is_accessible: bool,

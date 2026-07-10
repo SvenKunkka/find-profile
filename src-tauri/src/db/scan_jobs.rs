@@ -103,10 +103,7 @@ pub fn finish_scan_job(
 ///
 /// Used by the `get_scan_status` command to answer "what is this root doing
 /// right now?" — returns `Ok(None)` when the root has never been scanned.
-pub fn get_latest_scan_job_for_root(
-    conn: &Connection,
-    root_id: i64,
-) -> Result<Option<ScanJob>> {
+pub fn get_latest_scan_job_for_root(conn: &Connection, root_id: i64) -> Result<Option<ScanJob>> {
     let sql = format!(
         "SELECT {SELECT_COLS} FROM scan_jobs
          WHERE root_id = ?1
@@ -124,4 +121,27 @@ pub fn get_scan_job(conn: &Connection, job_id: i64) -> Result<ScanJob> {
         .optional()?
         .ok_or_else(|| DbError::NotFound(format!("scan job id {job_id}")))?;
     Ok(job)
+}
+
+/// Clear scan state left behind if the app was quit or force-killed while a
+/// background scan was running. Without this, a root can stay stuck as
+/// `scanning` on the next launch and the UI cannot start a fresh scan.
+pub fn cleanup_interrupted_scans(conn: &Connection) -> Result<usize> {
+    let now = now_iso();
+    let jobs = conn.execute(
+        "UPDATE scan_jobs
+         SET status = ?1, finished_at = ?2, error_message = ?3
+         WHERE status = ?4",
+        params![
+            ScanJobStatus::Cancelled,
+            now,
+            "cancelled because the previous app session ended",
+            ScanJobStatus::Running
+        ],
+    )?;
+    let roots = conn.execute(
+        "UPDATE roots SET status = 'available', updated_at = ?1 WHERE status = 'scanning'",
+        params![now],
+    )?;
+    Ok(jobs + roots)
 }

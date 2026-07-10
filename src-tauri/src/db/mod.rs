@@ -15,8 +15,8 @@ use rusqlite::Connection;
 pub use error::{DbError, Result};
 pub use files::{
     begin_index_transaction, load_root_file_index, mark_files_inaccessible, remove_file,
-    search_files, search_files_with_options, upsert_file, upsert_file_in_transaction,
-    FileSnapshot, SearchOptions, SortBy,
+    search_files, search_files_with_options, upsert_file, upsert_file_in_transaction, FileSnapshot,
+    SearchOptions, SortBy, SortDirection,
 };
 pub use model::{
     EnumParseError, FileHit, FileMetadata, Root, RootKind, RootStatus, ScanJob, ScanJobStatus,
@@ -26,8 +26,8 @@ pub use roots::{
     update_root_status,
 };
 pub use scan_jobs::{
-    create_scan_job, finish_scan_job, get_latest_scan_job_for_root, get_scan_job,
-    update_scan_job_estimated_total, update_scan_job_progress,
+    cleanup_interrupted_scans, create_scan_job, finish_scan_job, get_latest_scan_job_for_root,
+    get_scan_job, update_scan_job_estimated_total, update_scan_job_progress,
 };
 
 pub fn init_db<P: AsRef<Path>>(path: P) -> Result<Connection> {
@@ -74,11 +74,10 @@ mod tests {
             root_id,
             path: path.to_string(),
             name: name.to_string(),
-            extension: name
-                .rsplit_once('.')
-                .map(|(_, ext)| ext.to_lowercase()),
+            extension: name.rsplit_once('.').map(|(_, ext)| ext.to_lowercase()),
             size: Some(1024),
             modified_at: Some("2026-05-09T00:00:00Z".to_string()),
+            added_at: Some("2026-05-08T00:00:00Z".to_string()),
             is_dir: false,
             source_kind: RootKind::Local,
             is_accessible: true,
@@ -200,7 +199,11 @@ mod tests {
     fn search_files_matches_by_name() {
         let conn = init_in_memory_db().unwrap();
         let r = add_root(&conn, "/a", RootKind::Local).unwrap();
-        upsert_file(&conn, &meta(r.id, "/a/annual_report.pdf", "annual_report.pdf")).unwrap();
+        upsert_file(
+            &conn,
+            &meta(r.id, "/a/annual_report.pdf", "annual_report.pdf"),
+        )
+        .unwrap();
         upsert_file(&conn, &meta(r.id, "/a/cat.jpg", "cat.jpg")).unwrap();
 
         let hits = search_files(&conn, "annual", 10, 0).unwrap();
@@ -248,7 +251,9 @@ mod tests {
             "new name should be searchable"
         );
         assert!(
-            search_files(&conn, "alphareport", 10, 0).unwrap().is_empty(),
+            search_files(&conn, "alphareport", 10, 0)
+                .unwrap()
+                .is_empty(),
             "old name should no longer match after upsert"
         );
     }
@@ -466,11 +471,7 @@ mod tests {
     fn search_files_returns_current_root_status() {
         let conn = init_in_memory_db().unwrap();
         let r = add_root(&conn, "/Volumes/Backup", RootKind::Nas).unwrap();
-        upsert_file(
-            &conn,
-            &meta(r.id, "/Volumes/Backup/file.txt", "file.txt"),
-        )
-        .unwrap();
+        upsert_file(&conn, &meta(r.id, "/Volumes/Backup/file.txt", "file.txt")).unwrap();
 
         let hits_avail = search_files(&conn, "file", 10, 0).unwrap();
         assert_eq!(hits_avail.len(), 1);
@@ -561,10 +562,27 @@ mod tests {
             },
             size,
             modified_at: modified_at.map(|s| s.to_string()),
+            added_at: None,
             is_dir,
             source_kind,
             is_accessible: true,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn meta_with_added(
+        root_id: i64,
+        path: &str,
+        name: &str,
+        is_dir: bool,
+        size: Option<i64>,
+        modified_at: Option<&str>,
+        added_at: Option<&str>,
+        source_kind: RootKind,
+    ) -> FileMetadata {
+        let mut m = meta_with(root_id, path, name, is_dir, size, modified_at, source_kind);
+        m.added_at = added_at.map(|s| s.to_string());
+        m
     }
 
     #[test]
@@ -573,11 +591,7 @@ mod tests {
         let r = add_root(&conn, "/a", RootKind::Local).unwrap();
 
         // File 1: "kw" appears only in the path tokens, not in the name.
-        upsert_file(
-            &conn,
-            &meta(r.id, "/a/kw/other.txt", "other.txt"),
-        )
-        .unwrap();
+        upsert_file(&conn, &meta(r.id, "/a/kw/other.txt", "other.txt")).unwrap();
         // File 2: "kw" appears in both the name and the path.
         upsert_file(&conn, &meta(r.id, "/a/x/kw.txt", "kw.txt")).unwrap();
 
@@ -766,6 +780,7 @@ mod tests {
 
         let mut opts = SearchOptions::simple("txt", 10, 0);
         opts.sort = SortBy::Modified;
+        opts.sort_direction = SortDirection::Desc;
         let hits = search_files_with_options(&conn, &opts).unwrap();
         let names: Vec<_> = hits.iter().map(|h| h.name.as_str()).collect();
         assert_eq!(names, vec!["new.txt", "old.txt", "null.txt"]);
@@ -817,9 +832,66 @@ mod tests {
 
         let mut opts = SearchOptions::simple("txt", 10, 0);
         opts.sort = SortBy::Size;
+        opts.sort_direction = SortDirection::Desc;
         let hits = search_files_with_options(&conn, &opts).unwrap();
         let names: Vec<_> = hits.iter().map(|h| h.name.as_str()).collect();
         assert_eq!(names, vec!["big.txt", "medium.txt", "small.txt"]);
+    }
+
+    #[test]
+    fn search_options_sort_by_added_time_desc_with_nulls_last() {
+        let conn = init_in_memory_db().unwrap();
+        let r = add_root(&conn, "/a", RootKind::Local).unwrap();
+        upsert_file(
+            &conn,
+            &meta_with_added(
+                r.id,
+                "/a/old.txt",
+                "old.txt",
+                false,
+                Some(1),
+                None,
+                Some("2020-01-01T00:00:00Z"),
+                RootKind::Local,
+            ),
+        )
+        .unwrap();
+        upsert_file(
+            &conn,
+            &meta_with_added(
+                r.id,
+                "/a/new.txt",
+                "new.txt",
+                false,
+                Some(1),
+                None,
+                Some("2026-05-09T00:00:00Z"),
+                RootKind::Local,
+            ),
+        )
+        .unwrap();
+        upsert_file(
+            &conn,
+            &meta_with_added(
+                r.id,
+                "/a/null.txt",
+                "null.txt",
+                false,
+                Some(1),
+                None,
+                None,
+                RootKind::Local,
+            ),
+        )
+        .unwrap();
+
+        let mut opts = SearchOptions::simple("txt", 10, 0);
+        opts.sort = SortBy::Added;
+        opts.sort_direction = SortDirection::Desc;
+        let hits = search_files_with_options(&conn, &opts).unwrap();
+        let names: Vec<_> = hits.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, vec!["new.txt", "old.txt", "null.txt"]);
+        assert_eq!(hits[0].added_at.as_deref(), Some("2026-05-09T00:00:00Z"));
     }
 
     #[test]

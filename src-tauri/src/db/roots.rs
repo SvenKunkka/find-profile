@@ -4,7 +4,8 @@ use super::error::{DbError, Result};
 use super::model::{Root, RootKind, RootStatus};
 use super::util::now_iso;
 
-const SELECT_COLS: &str = "id, path, kind, enabled, status, scan_interval, last_scanned_at, created_at, updated_at";
+const SELECT_COLS: &str =
+    "id, path, kind, enabled, status, scan_interval, last_scanned_at, created_at, updated_at";
 
 fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Root> {
     Ok(Root {
@@ -76,9 +77,7 @@ pub fn find_root_for_path(conn: &Connection, path: &str) -> Result<Option<Root>>
          ORDER BY length(path) DESC
          LIMIT 1"
     );
-    let root = conn
-        .query_row(&sql, params![path], map_row)
-        .optional()?;
+    let root = conn.query_row(&sql, params![path], map_row).optional()?;
     Ok(root)
 }
 

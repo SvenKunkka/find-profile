@@ -11,9 +11,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
-use crate::db::{
-    self, DbError, FileMetadata, FileSnapshot, RootKind, RootStatus, ScanJobStatus,
-};
+use crate::db::{self, DbError, FileMetadata, FileSnapshot, RootKind, RootStatus, ScanJobStatus};
 use crate::roots::{decide_status_from_accessibility, probe_path_accessibility};
 
 pub use cancel::ScanCancellations;
@@ -246,6 +244,7 @@ pub fn scan_cancellable(
                                 if s.is_dir == m.is_dir
                                     && s.size == m.size
                                     && s.modified_at == m.modified_at
+                                    && s.added_at == m.added_at
                         );
                         if unchanged {
                             // Already indexed with identical metadata — skip
@@ -269,8 +268,7 @@ pub fn scan_cancellable(
 
         if buffer.len() >= BATCH_SIZE {
             let total_now = scanned + errors;
-            let should_emit_progress = (total_now - last_progress_count)
-                >= PROGRESS_DB_INTERVAL
+            let should_emit_progress = (total_now - last_progress_count) >= PROGRESS_DB_INTERVAL
                 || last_progress_at.elapsed().as_millis() >= PROGRESS_TIME_MS;
             {
                 let mut g = lock(&conn)?;
@@ -312,19 +310,8 @@ pub fn scan_cancellable(
     };
     {
         let mut g = lock(&conn)?;
-        flush_locked_with_missing(
-            &mut g,
-            &mut buffer,
-            input.root_id,
-            &leftover_missing,
-        )?;
-        db::update_scan_job_progress(
-            &g,
-            job_id,
-            scanned,
-            errors,
-            current_path.as_deref(),
-        )?;
+        flush_locked_with_missing(&mut g, &mut buffer, input.root_id, &leftover_missing)?;
+        db::update_scan_job_progress(&g, job_id, scanned, errors, current_path.as_deref())?;
     }
     on_progress(&Progress {
         job_id,
@@ -360,12 +347,7 @@ pub fn scan_cancellable(
     } else {
         None
     };
-    tracing::info!(
-        root_id = input.root_id,
-        scanned,
-        errors,
-        "scan finished",
-    );
+    tracing::info!(root_id = input.root_id, scanned, errors, "scan finished",);
     db::finish_scan_job(&g, job_id, ScanJobStatus::Success, final_msg.as_deref())?;
     db::update_root_status(&g, input.root_id, RootStatus::Available)?;
 
@@ -379,9 +361,7 @@ pub fn scan_cancellable(
     })
 }
 
-fn lock(
-    conn: &Arc<Mutex<Connection>>,
-) -> Result<std::sync::MutexGuard<'_, Connection>> {
+fn lock(conn: &Arc<Mutex<Connection>>) -> Result<std::sync::MutexGuard<'_, Connection>> {
     conn.lock().map_err(|_| ScanError::PoisonedLock)
 }
 
@@ -476,6 +456,7 @@ mod tests {
             extension: name.rsplit_once('.').map(|(_, e)| e.to_lowercase()),
             size: Some(1),
             modified_at: None,
+            added_at: None,
             is_dir: false,
             source_kind: kind,
             is_accessible: true,
@@ -607,7 +588,12 @@ mod tests {
             let r = register_root(&g, &bogus, Some("local")).unwrap();
             upsert_file(
                 &g,
-                &cached_row(r.id, &format!("{bogus}/old.txt"), "old.txt", RootKind::Local),
+                &cached_row(
+                    r.id,
+                    &format!("{bogus}/old.txt"),
+                    "old.txt",
+                    RootKind::Local,
+                ),
             )
             .unwrap();
             r
@@ -802,7 +788,10 @@ mod tests {
         let count: i64 = g
             .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 0, "pre-cancelled scan must not have indexed anything");
+        assert_eq!(
+            count, 0,
+            "pre-cancelled scan must not have indexed anything"
+        );
 
         let job_status: String = g
             .query_row(
@@ -954,7 +943,10 @@ mod tests {
                 ..ScanFilters::default()
             },
         );
-        assert_eq!(outcome.scanned_count, 1, "only the directory should be indexed");
+        assert_eq!(
+            outcome.scanned_count, 1,
+            "only the directory should be indexed"
+        );
         let g = conn.lock().unwrap();
         let hits = search_files(&g, "txt", 10, 0).unwrap();
         assert!(hits.iter().all(|h| h.is_dir));
@@ -1054,12 +1046,17 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(inacc, 1, "exactly the deleted file must be marked inaccessible");
+        assert_eq!(
+            inacc, 1,
+            "exactly the deleted file must be marked inaccessible"
+        );
 
         // The deleted file must still be searchable (it just shows as
         // unavailable in the UI).
         let hits = search_files(&g, "gone", 10, 0).unwrap();
-        assert!(hits.iter().any(|h| h.name == "gone.txt" && !h.is_accessible));
+        assert!(hits
+            .iter()
+            .any(|h| h.name == "gone.txt" && !h.is_accessible));
 
         drop(g);
         cleanup(&dir);
@@ -1092,14 +1089,8 @@ mod tests {
         fs::remove_file(dir.join("b.txt")).unwrap();
 
         let cancel = Arc::new(AtomicBool::new(true));
-        let outcome = scan_cancellable(
-            conn.clone(),
-            input,
-            ScanFilters::default(),
-            cancel,
-            |_| {},
-        )
-        .unwrap();
+        let outcome =
+            scan_cancellable(conn.clone(), input, ScanFilters::default(), cancel, |_| {}).unwrap();
         assert_eq!(outcome.status, ScanJobStatus::Cancelled);
 
         let g = conn.lock().unwrap();
@@ -1255,11 +1246,9 @@ mod tests {
 
         let g = conn.lock().unwrap();
         let status: String = g
-            .query_row(
-                "SELECT status FROM roots WHERE id = ?1",
-                [root.id],
-                |r| r.get(0),
-            )
+            .query_row("SELECT status FROM roots WHERE id = ?1", [root.id], |r| {
+                r.get(0)
+            })
             .unwrap();
         drop(g);
         assert_eq!(status, "available");

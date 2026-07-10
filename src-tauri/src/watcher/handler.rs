@@ -20,9 +20,7 @@ pub fn handle_event(
     let event = match res {
         Ok(ev) => ev,
         Err(e) => {
-            eprintln!(
-                "watcher: notify reported an error for root {root_id}: {e}"
-            );
+            eprintln!("watcher: notify reported an error for root {root_id}: {e}");
             return;
         }
     };
@@ -110,8 +108,13 @@ fn upsert_path(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let is_dir = metadata.is_dir();
-    let size = if is_dir { None } else { Some(metadata.len() as i64) };
+    let size = if is_dir {
+        None
+    } else {
+        Some(metadata.len() as i64)
+    };
     let modified_at = metadata.modified().ok().and_then(system_time_to_iso);
+    let added_at = metadata.created().ok().and_then(system_time_to_iso);
     let extension = if is_dir {
         None
     } else {
@@ -127,6 +130,7 @@ fn upsert_path(
         extension,
         size,
         modified_at,
+        added_at,
         is_dir,
         source_kind,
         is_accessible: true,
@@ -139,10 +143,7 @@ fn upsert_path(
     Ok(())
 }
 
-fn remove_path(
-    path: &Path,
-    conn: &Arc<Mutex<Connection>>,
-) -> Result<(), String> {
+fn remove_path(path: &Path, conn: &Arc<Mutex<Connection>>) -> Result<(), String> {
     let path_str = path.to_string_lossy().into_owned();
     let conn_guard = conn
         .lock()

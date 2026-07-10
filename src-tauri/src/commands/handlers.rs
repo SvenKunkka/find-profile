@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::MutexGuard;
 
@@ -11,6 +11,7 @@ use tauri::Manager;
 
 use crate::db::{
     self, FileHit, Root, RootKind, RootStatus, ScanJob, ScanJobStatus, SearchOptions, SortBy,
+    SortDirection,
 };
 use crate::roots::register_root;
 use crate::scanner::{self, ScanFilters, ScanInput};
@@ -222,7 +223,13 @@ pub(crate) fn scan_all_roots_inner(state: &AppState) -> CommandResult<i64> {
     // mixed local+NAS setup the slow NAS scan can starve the fast local
     // one of writer time. A single worker that processes roots one at a
     // time gives each scan full bandwidth and produces predictable timing.
-    type QueueItem = (i64, String, RootKind, ScanFilters, std::sync::Arc<std::sync::atomic::AtomicBool>);
+    type QueueItem = (
+        i64,
+        String,
+        RootKind,
+        ScanFilters,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    );
     let mut queue: Vec<QueueItem> = Vec::new();
     for r in roots.iter().filter(|r| r.enabled) {
         let cancel = match state.scan_cancellations.try_register(r.id) {
@@ -296,6 +303,7 @@ pub fn search_files(
     source: Option<String>,
     type_filter: Option<String>,
     sort: Option<String>,
+    sort_direction: Option<String>,
 ) -> CommandResult<Vec<FileHit>> {
     let limit = limit.clamp(1, SEARCH_LIMIT_MAX);
     let offset = offset.max(0);
@@ -322,12 +330,28 @@ pub fn search_files(
     let sort_by = match sort.as_deref() {
         None | Some("") | Some("relevance") => SortBy::Relevance,
         Some("modified") => SortBy::Modified,
+        Some("added") => SortBy::Added,
         Some("size") => SortBy::Size,
         Some("name") => SortBy::Name,
+        Some("extension") => SortBy::Extension,
+        Some("type") => SortBy::Type,
+        Some("source") => SortBy::Source,
+        Some("accessibility") => SortBy::Accessibility,
         Some(other) => {
             return Err(CommandError::new(
                 "invalid_sort",
                 format!("invalid sort: {other}"),
+            ))
+        }
+    };
+
+    let direction = match sort_direction.as_deref() {
+        None | Some("") | Some("asc") => SortDirection::Asc,
+        Some("desc") => SortDirection::Desc,
+        Some(other) => {
+            return Err(CommandError::new(
+                "invalid_sort",
+                format!("invalid sort direction: {other}"),
             ))
         }
     };
@@ -347,6 +371,7 @@ pub fn search_files(
         source: source_kind,
         is_dir_filter,
         sort: sort_by,
+        sort_direction: direction,
     };
 
     let conn = lock_conn(&state)?;
@@ -355,6 +380,7 @@ pub fn search_files(
         query = %options.query,
         count = hits.len(),
         sort = ?options.sort,
+        direction = ?options.sort_direction,
         source = ?options.source,
         "search_files",
     );
@@ -377,6 +403,14 @@ pub fn reveal_in_finder(state: State<'_, AppState>, path: String) -> CommandResu
         check_root_reachable(&conn, &path)?;
     }
     open_with_macos(&path, /* reveal */ true)
+}
+
+#[tauri::command]
+pub fn jump_to_path(path_input: String) -> CommandResult<String> {
+    let path = normalize_jump_path(&path_input)?;
+    let open_path = resolve_jump_open_path(&path)?;
+    open_with_macos(&open_path, /* reveal */ false)?;
+    Ok(open_path)
 }
 
 /// Reject open/reveal early when the path lives under a root that is currently
@@ -444,6 +478,212 @@ fn open_with_macos(path: &str, reveal: bool) -> CommandResult<()> {
     Ok(())
 }
 
+fn normalize_jump_path(input: &str) -> CommandResult<String> {
+    let cleaned = clean_pasted_path(input);
+    if cleaned.is_empty() {
+        return Err(CommandError::new("path", "path input is empty"));
+    }
+
+    for candidate in extract_jump_path_candidates(&cleaned) {
+        if let Some(path) = normalize_unc_or_smb_path(&candidate) {
+            return Ok(path);
+        }
+        if candidate.starts_with('/') || candidate.starts_with('~') {
+            return Ok(expand_home_path(&candidate));
+        }
+    }
+
+    Err(CommandError::new(
+        "unsupported_path",
+        "only macOS absolute paths, smb URLs, and Windows UNC paths are supported",
+    ))
+}
+
+fn clean_pasted_path(input: &str) -> String {
+    let mut out = input.trim().to_string();
+    out = strip_balanced_wrappers(out);
+    out = replace_markdown_links(&out);
+    strip_balanced_wrappers(out.trim().to_string())
+}
+
+fn extract_jump_path_candidates(input: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for line in input.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(start) = find_path_start(line) {
+            let candidate = clean_candidate_path(&line[start..]);
+            if !candidate.is_empty() {
+                candidates.push(candidate);
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        candidates.push(clean_candidate_path(input));
+    }
+    candidates
+}
+
+fn find_path_start(line: &str) -> Option<usize> {
+    [
+        "smb://",
+        "file://",
+        "\\\\",
+        "//",
+        "/Volumes/",
+        "~/",
+        "/Users/",
+    ]
+    .iter()
+    .filter_map(|marker| line.find(marker))
+    .min()
+}
+
+fn clean_candidate_path(input: &str) -> String {
+    let mut out = strip_balanced_wrappers(input.trim().to_string());
+    out = out
+        .trim_matches(|c: char| {
+            matches!(
+                c,
+                '<' | '>'
+                    | '\''
+                    | '"'
+                    | '`'
+                    | '“'
+                    | '”'
+                    | '‘'
+                    | '’'
+                    | '，'
+                    | '。'
+                    | '；'
+                    | ';'
+                    | ','
+                    | '、'
+                    | '：'
+                    | ':'
+            )
+        })
+        .trim()
+        .to_string();
+    strip_balanced_wrappers(out)
+}
+
+fn strip_balanced_wrappers(mut value: String) -> String {
+    loop {
+        let trimmed = value.trim();
+        let Some(first) = trimmed.chars().next() else {
+            return String::new();
+        };
+        let Some(last) = trimmed.chars().last() else {
+            return String::new();
+        };
+        let wrapped = matches!(
+            (first, last),
+            ('\'', '\'') | ('"', '"') | ('`', '`') | ('“', '”') | ('‘', '’')
+        );
+        if !wrapped || trimmed.len() < 2 {
+            return trimmed.to_string();
+        }
+        value = trimmed
+            .trim_start_matches(first)
+            .trim_end_matches(last)
+            .trim()
+            .to_string();
+    }
+}
+
+fn replace_markdown_links(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find('[') {
+        let (before, after_start) = rest.split_at(start);
+        out.push_str(before);
+        let after_start = &after_start[1..];
+        let Some(end_label) = after_start.find("](") else {
+            out.push('[');
+            out.push_str(after_start);
+            return out;
+        };
+        let label = &after_start[..end_label];
+        let after_label = &after_start[end_label + 2..];
+        let Some(end_url) = after_label.find(')') else {
+            out.push('[');
+            out.push_str(after_start);
+            return out;
+        };
+        out.push_str(label);
+        rest = &after_label[end_url + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn normalize_unc_or_smb_path(input: &str) -> Option<String> {
+    let normalized = input.replace('\\', "/");
+    let without_scheme = normalized
+        .strip_prefix("smb://")
+        .or_else(|| normalized.strip_prefix("file://"))
+        .unwrap_or(&normalized);
+    let trimmed = without_scheme.trim_start_matches('/');
+    let is_unc = normalized.starts_with("//") || input.starts_with("\\\\");
+    let is_smb = input.starts_with("smb://");
+    if !is_unc && !is_smb {
+        return None;
+    }
+
+    let mut parts = trimmed.split('/').filter(|p| !p.is_empty());
+    let _server = parts.next()?;
+    let share = parts.next()?;
+    let mut path = PathBuf::from("/Volumes");
+    path.push(share);
+    for part in parts {
+        path.push(part);
+    }
+    Some(path.to_string_lossy().into_owned())
+}
+
+fn expand_home_path(input: &str) -> String {
+    if input == "~" {
+        return std::env::var("HOME").unwrap_or_else(|_| input.to_string());
+    }
+    if let Some(rest) = input.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return Path::new(&home).join(rest).to_string_lossy().into_owned();
+        }
+    }
+    input.to_string()
+}
+
+fn resolve_jump_open_path(path: &str) -> CommandResult<String> {
+    let target = Path::new(path);
+    if target.is_dir() {
+        return Ok(path.to_string());
+    }
+
+    if target.is_file() || looks_like_file_path(target) {
+        if let Some(parent) = target.parent() {
+            if parent.exists() && parent.is_dir() {
+                return Ok(parent.to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    Err(CommandError::new(
+        "not_found",
+        format!("path not found or not accessible: {path}"),
+    ))
+}
+
+fn looks_like_file_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.rsplit_once('.'))
+        .is_some_and(|(stem, ext)| !stem.is_empty() && !ext.is_empty())
+}
+
 #[tauri::command]
 pub fn remove_index_root(
     state: State<'_, AppState>,
@@ -475,10 +715,7 @@ pub fn get_settings(state: State<'_, AppState>) -> CommandResult<Settings> {
 }
 
 #[tauri::command]
-pub fn update_settings(
-    state: State<'_, AppState>,
-    settings: Settings,
-) -> CommandResult<Settings> {
+pub fn update_settings(state: State<'_, AppState>, settings: Settings) -> CommandResult<Settings> {
     let sanitized = settings.sanitized();
     {
         let conn = lock_conn(&state)?;
@@ -566,4 +803,113 @@ pub fn open_log_dir(app: AppHandle) -> CommandResult<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod path_jump_tests {
+    use std::fs;
+    use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{normalize_jump_path, resolve_jump_open_path};
+
+    #[test]
+    fn normalizes_windows_unc_path_to_macos_volume_path() {
+        let path = normalize_jump_path(r"\\192.168.1.26\渲染图和3d模型\00-公司产品模型\鼠标\G6HE")
+            .unwrap();
+        assert_eq!(path, "/Volumes/渲染图和3d模型/00-公司产品模型/鼠标/G6HE");
+    }
+
+    #[test]
+    fn normalizes_windows_unc_path_with_markdown_host() {
+        let path = normalize_jump_path(
+            r"\\[192.168.1.26](http://192.168.1.26)\渲染图和3d模型\00-公司产品模型\鼠标\G6HE",
+        )
+        .unwrap();
+        assert_eq!(path, "/Volumes/渲染图和3d模型/00-公司产品模型/鼠标/G6HE");
+    }
+
+    #[test]
+    fn accepts_quoted_macos_volume_path() {
+        let path = normalize_jump_path("'/Volumes/Keychron 包材/02-Lemokey'").unwrap();
+        assert_eq!(path, "/Volumes/Keychron 包材/02-Lemokey");
+    }
+
+    #[test]
+    fn normalizes_smb_url_to_macos_volume_path() {
+        let path = normalize_jump_path("smb://192.168.1.26/渲染图和3d模型/鼠标").unwrap();
+        assert_eq!(path, "/Volumes/渲染图和3d模型/鼠标");
+    }
+
+    #[test]
+    fn rejects_relative_paths() {
+        let err = normalize_jump_path("渲染图和3d模型/鼠标").unwrap_err();
+        assert_eq!(err.code, "unsupported_path");
+    }
+
+    #[test]
+    fn extracts_path_from_mixed_chat_message() {
+        let message = r"
+@Nick Xu 已更新至NAS
+\\KeychronNAS\亚马逊和官网图片\04-渲染&设计\轴体单独PNG\嘉达隆\星云轴V2\新旧对照
+[图片]
+";
+        let path = normalize_jump_path(message).unwrap();
+        assert_eq!(
+            path,
+            "/Volumes/亚马逊和官网图片/04-渲染&设计/轴体单独PNG/嘉达隆/星云轴V2/新旧对照"
+        );
+    }
+
+    #[test]
+    fn extracts_quoted_macos_path_from_mixed_message() {
+        let message = "麻烦看下这个目录：'/Volumes/Keychron 包材/02-Lemokey'\n图片如下";
+        let path = normalize_jump_path(message).unwrap();
+        assert_eq!(path, "/Volumes/Keychron 包材/02-Lemokey");
+    }
+
+    #[test]
+    fn file_path_opens_parent_folder_when_file_exists() {
+        let dir = make_test_dir("existing-file-parent");
+        let file = dir.join("磁轴438.png");
+        fs::write(&file, b"png").unwrap();
+
+        let open_path = resolve_jump_open_path(file.to_str().unwrap()).unwrap();
+        assert_eq!(Path::new(&open_path), dir.as_path());
+
+        fs::remove_file(file).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn file_like_missing_path_opens_parent_folder_when_parent_exists() {
+        let dir = make_test_dir("missing-file-parent");
+        let file = dir.join("磁轴438.png");
+
+        let open_path = resolve_jump_open_path(file.to_str().unwrap()).unwrap();
+        assert_eq!(Path::new(&open_path), dir.as_path());
+
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn missing_folder_path_still_returns_not_found() {
+        let dir = make_test_dir("missing-folder-parent");
+        let missing_folder = dir.join("新旧对照");
+
+        let err = resolve_jump_open_path(missing_folder.to_str().unwrap()).unwrap_err();
+        assert_eq!(err.code, "not_found");
+
+        fs::remove_dir(dir).unwrap();
+    }
+
+    fn make_test_dir(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("find-profile-{name}-{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 }

@@ -8,15 +8,16 @@ use super::util::now_iso;
 
 const UPSERT_SQL: &str = r#"
 INSERT INTO files (
-    root_id, path, name, extension, size, modified_at,
+    root_id, path, name, extension, size, modified_at, added_at,
     is_dir, source_kind, is_accessible, indexed_at
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
 ON CONFLICT(path) DO UPDATE SET
     root_id = excluded.root_id,
     name = excluded.name,
     extension = excluded.extension,
     size = excluded.size,
     modified_at = excluded.modified_at,
+    added_at = excluded.added_at,
     is_dir = excluded.is_dir,
     source_kind = excluded.source_kind,
     is_accessible = excluded.is_accessible,
@@ -35,6 +36,7 @@ fn do_upsert(conn: &Connection, m: &FileMetadata) -> Result<i64> {
             m.extension,
             m.size,
             m.modified_at,
+            m.added_at,
             m.is_dir,
             m.source_kind,
             m.is_accessible,
@@ -70,6 +72,7 @@ pub fn remove_file(conn: &Connection, path: &str) -> Result<()> {
 pub struct FileSnapshot {
     pub size: Option<i64>,
     pub modified_at: Option<String>,
+    pub added_at: Option<String>,
     pub is_dir: bool,
 }
 
@@ -84,14 +87,15 @@ pub fn load_root_file_index(
     root_id: i64,
 ) -> Result<std::collections::HashMap<String, FileSnapshot>> {
     let mut stmt = conn.prepare(
-        "SELECT path, size, modified_at, is_dir FROM files WHERE root_id = ?1",
+        "SELECT path, size, modified_at, added_at, is_dir FROM files WHERE root_id = ?1",
     )?;
     let rows = stmt.query_map(params![root_id], |row| {
         let path: String = row.get(0)?;
         let snap = FileSnapshot {
             size: row.get(1)?,
             modified_at: row.get(2)?,
-            is_dir: row.get::<_, i64>(3)? != 0,
+            added_at: row.get(3)?,
+            is_dir: row.get::<_, i64>(4)? != 0,
         };
         Ok((path, snap))
     })?;
@@ -110,11 +114,7 @@ pub fn load_root_file_index(
 ///
 /// We never call this on cancellation or preflight failure — both leave the
 /// index untouched so old data stays usable.
-pub fn mark_files_inaccessible(
-    tx: &Transaction<'_>,
-    root_id: i64,
-    paths: &[String],
-) -> Result<()> {
+pub fn mark_files_inaccessible(tx: &Transaction<'_>, root_id: i64, paths: &[String]) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
     }
@@ -148,7 +148,8 @@ pub fn mark_files_inaccessible(
     Ok(())
 }
 
-const SEARCH_SELECT: &str = "SELECT f.id, f.root_id, f.path, f.name, f.extension, f.size, f.modified_at,
+const SEARCH_SELECT: &str =
+    "SELECT f.id, f.root_id, f.path, f.name, f.extension, f.size, f.modified_at, f.added_at,
        f.is_dir, f.source_kind, f.is_accessible, f.indexed_at,
        r.status AS root_status
 FROM files_fts fts
@@ -156,22 +157,40 @@ JOIN files f ON f.id = fts.rowid
 JOIN roots r ON r.id = f.root_id
 WHERE files_fts MATCH ?";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SortBy {
     /// FTS5 BM25 with the `name` column weighted 10× the `path` column.
+    #[default]
     Relevance,
     /// `modified_at DESC NULLS LAST` — newest first.
     Modified,
+    /// File-system creation/birth time, used as the macOS "date added" value.
+    Added,
     /// `size DESC NULLS LAST` — largest first.
     Size,
     /// `name COLLATE NOCASE ASC` — A→Z, case-insensitive.
     Name,
+    Extension,
+    Type,
+    Source,
+    Accessibility,
 }
 
-impl Default for SortBy {
-    fn default() -> Self {
-        SortBy::Relevance
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SortDirection {
+    #[default]
+    Asc,
+    Desc,
+}
+
+impl SortDirection {
+    fn sql(self) -> &'static str {
+        match self {
+            Self::Asc => "ASC",
+            Self::Desc => "DESC",
+        }
     }
 }
 
@@ -187,6 +206,7 @@ pub struct SearchOptions {
     /// `None` = both files and directories. `Some(true)` = directories only.
     pub is_dir_filter: Option<bool>,
     pub sort: SortBy,
+    pub sort_direction: SortDirection,
 }
 
 impl SearchOptions {
@@ -200,6 +220,7 @@ impl SearchOptions {
             source: None,
             is_dir_filter: None,
             sort: SortBy::Relevance,
+            sort_direction: SortDirection::Asc,
         }
     }
 }
@@ -233,11 +254,12 @@ pub fn search_files_with_options(
             extension: row.get(4)?,
             size: row.get(5)?,
             modified_at: row.get(6)?,
-            is_dir: row.get::<_, i64>(7)? != 0,
-            source_kind: row.get(8)?,
-            is_accessible: row.get::<_, i64>(9)? != 0,
-            indexed_at: row.get(10)?,
-            root_status: row.get(11)?,
+            added_at: row.get(7)?,
+            is_dir: row.get::<_, i64>(8)? != 0,
+            source_kind: row.get(9)?,
+            is_accessible: row.get::<_, i64>(10)? != 0,
+            indexed_at: row.get(11)?,
+            root_status: row.get(12)?,
         })
     })?;
     let mut out = Vec::new();
@@ -265,20 +287,48 @@ fn build_search_sql(options: &SearchOptions, fts_query: String) -> (String, Vec<
         let placeholders = vec!["?"; options.extensions.len()].join(",");
         sql.push_str(&format!(" AND f.extension IN ({placeholders})"));
         for ext in &options.extensions {
-            params.push(Value::Text(
-                ext.trim_start_matches('.').to_lowercase(),
+            params.push(Value::Text(ext.trim_start_matches('.').to_lowercase()));
+        }
+    }
+
+    let dir = options.sort_direction.sql();
+    match options.sort {
+        // BM25 returns lower scores for stronger matches; weighting `name`
+        // 10× `path` makes filename matches outrank path-only matches.
+        SortBy::Relevance => {
+            sql.push_str(" ORDER BY bm25(files_fts, 10.0, 1.0) ASC");
+        }
+        SortBy::Modified => {
+            sql.push_str(&format!(" ORDER BY f.modified_at {dir} NULLS LAST"));
+        }
+        SortBy::Added => {
+            sql.push_str(&format!(" ORDER BY f.added_at {dir} NULLS LAST"));
+        }
+        SortBy::Size => {
+            sql.push_str(&format!(" ORDER BY f.size {dir} NULLS LAST"));
+        }
+        SortBy::Name => {
+            sql.push_str(&format!(" ORDER BY f.name COLLATE NOCASE {dir}"));
+        }
+        SortBy::Extension => {
+            sql.push_str(&format!(
+                " ORDER BY f.extension IS NULL ASC, f.extension COLLATE NOCASE {dir}"
+            ));
+        }
+        SortBy::Type => {
+            sql.push_str(&format!(" ORDER BY f.is_dir {dir}"));
+        }
+        SortBy::Source => {
+            sql.push_str(&format!(" ORDER BY f.source_kind COLLATE NOCASE {dir}"));
+        }
+        SortBy::Accessibility => {
+            sql.push_str(&format!(
+                " ORDER BY CASE WHEN r.status IN ('disconnected', 'error') THEN 0 ELSE f.is_accessible END {dir}"
             ));
         }
     }
 
-    sql.push_str(match options.sort {
-        // BM25 returns lower scores for stronger matches; weighting `name`
-        // 10× `path` makes filename matches outrank path-only matches.
-        SortBy::Relevance => " ORDER BY bm25(files_fts, 10.0, 1.0) ASC",
-        SortBy::Modified => " ORDER BY f.modified_at DESC NULLS LAST",
-        SortBy::Size => " ORDER BY f.size DESC NULLS LAST",
-        SortBy::Name => " ORDER BY f.name COLLATE NOCASE ASC",
-    });
+    sql.push_str(", f.name COLLATE NOCASE ASC, f.path COLLATE NOCASE ASC");
 
     sql.push_str(" LIMIT ? OFFSET ?");
     params.push(Value::Integer(options.limit));

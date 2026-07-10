@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS files (
     extension TEXT,
     size INTEGER,
     modified_at TEXT,
+    added_at TEXT,
     is_dir INTEGER NOT NULL,
     source_kind TEXT NOT NULL,
     is_accessible INTEGER NOT NULL,
@@ -85,6 +86,7 @@ CREATE TABLE IF NOT EXISTS settings (
 const MIGRATIONS: &[&str] = &[
     "ALTER TABLE scan_jobs ADD COLUMN estimated_total_count INTEGER",
     "ALTER TABLE scan_jobs ADD COLUMN current_path TEXT",
+    "ALTER TABLE files ADD COLUMN added_at TEXT",
 ];
 
 pub fn apply(conn: &Connection) -> Result<()> {

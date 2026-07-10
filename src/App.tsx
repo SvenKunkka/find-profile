@@ -6,7 +6,17 @@ type RootKind = "local" | "nas";
 type RootStatus = "available" | "disconnected" | "scanning" | "error";
 type SourceFilter = "all" | "local" | "nas";
 type TypeFilter = "all" | "files" | "dirs";
-type SortBy = "relevance" | "modified" | "size" | "name";
+type SortBy =
+  | "relevance"
+  | "name"
+  | "extension"
+  | "size"
+  | "modified"
+  | "added"
+  | "type"
+  | "source"
+  | "accessibility";
+type SortDirection = "asc" | "desc";
 
 interface Root {
   id: number;
@@ -28,6 +38,7 @@ interface FileHit {
   extension: string | null;
   size: number | null;
   modified_at: string | null;
+  added_at: string | null;
   is_dir: boolean;
   source_kind: RootKind;
   is_accessible: boolean;
@@ -105,6 +116,8 @@ function translateError(err: unknown): string {
       return "内部错误";
     case "path":
       return "路径解析失败";
+    case "unsupported_path":
+      return "只支持 macOS 绝对路径、smb 地址或 Windows 网络路径";
     case "scan":
       return "扫描失败";
     case "tauri":
@@ -171,6 +184,12 @@ function formatModified(iso: string | null): string {
   )}:${pad(d.getMinutes())}`;
 }
 
+function defaultSortDirection(sort: SortBy): SortDirection {
+  return sort === "modified" || sort === "added" || sort === "size"
+    ? "desc"
+    : "asc";
+}
+
 function parseExtensionInput(input: string): string[] {
   // Split on comma OR whitespace; strip leading dots; lowercase; dedupe.
   const seen = new Set<string>();
@@ -192,6 +211,8 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [currentRoot, setCurrentRoot] = useState<Root | null>(null);
   const [currentPath, setCurrentPath] = useState<string | null>(null);
+  const [pathJumpInput, setPathJumpInput] = useState("");
+  const [pathJumpBusy, setPathJumpBusy] = useState(false);
   const [searched, setSearched] = useState(false);
 
   // Filters / sort / pagination.
@@ -199,7 +220,13 @@ function App() {
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>("all");
   const [typeFilter, setTypeFilter] = useState<TypeFilter>("all");
   const [sortBy, setSortBy] = useState<SortBy>("relevance");
+  const [sortDirection, setSortDirection] = useState<SortDirection>("asc");
   const [page, setPage] = useState(0);
+  const [rootMenu, setRootMenu] = useState<{
+    root: Root;
+    x: number;
+    y: number;
+  } | null>(null);
 
   const searchTimer = useRef<number | null>(null);
 
@@ -227,7 +254,7 @@ function App() {
   // Reset to page 0 whenever the *content* of the result list might change.
   useEffect(() => {
     setPage(0);
-  }, [query, extensionInput, sourceFilter, typeFilter, sortBy]);
+  }, [query, extensionInput, sourceFilter, typeFilter, sortBy, sortDirection]);
 
   /**
    * Returns true when the visible-to-the-user fields of two root snapshots
@@ -358,6 +385,7 @@ function App() {
             source: sourceFilter === "all" ? null : sourceFilter,
             typeFilter: typeFilter === "all" ? null : typeFilter,
             sort: sortBy,
+            sortDirection,
           });
           if (!cancelled) {
             setResults(hits);
@@ -378,7 +406,7 @@ function App() {
         searchTimer.current = null;
       }
     };
-  }, [query, extensions, sourceFilter, typeFilter, sortBy, page]);
+  }, [query, extensions, sourceFilter, typeFilter, sortBy, sortDirection, page]);
 
   async function handleAddRoot() {
     console.log("add root clicked");
@@ -432,6 +460,29 @@ function App() {
     } catch (e) {
       console.error("start_scan failed", e);
       setError(`扫描目录失败：${translateError(e)}`);
+    }
+  }
+
+  async function handleDeleteRoot(root: Root) {
+    setRootMenu(null);
+    const ok = window.confirm(
+      `从 Find Profile 中删除这个索引目录吗？\n\n${root.path}\n\n只会删除列表记录和它的搜索索引，不会删除磁盘或 NAS 上的真实文件夹。`
+    );
+    if (!ok) return;
+    setError(null);
+    try {
+      await invoke("remove_index_root", {
+        rootId: root.id,
+        keepIndex: false,
+      });
+      setResults((prev) => prev.filter((hit) => hit.root_id !== root.id));
+      if (currentRoot?.id === root.id) {
+        setCurrentRoot(null);
+      }
+      await refreshRoots();
+    } catch (e) {
+      console.error("remove_index_root failed", e);
+      setError(`删除索引目录失败：${translateError(e)}`);
     }
   }
 
@@ -544,6 +595,27 @@ function App() {
     }
   }
 
+  async function handleJumpToPath() {
+    const value = pathJumpInput.trim();
+    if (value.length === 0) {
+      setError("请输入要打开的路径");
+      return;
+    }
+    setPathJumpBusy(true);
+    setError(null);
+    try {
+      const resolvedPath = await invoke<string>("jump_to_path", {
+        pathInput: value,
+      });
+      setCurrentPath(resolvedPath);
+    } catch (e) {
+      console.error("jump_to_path failed", e);
+      setError(`打开路径失败：${translateError(e)}`);
+    } finally {
+      setPathJumpBusy(false);
+    }
+  }
+
   const trimmedQuery = query.trim();
   const hasQuery = trimmedQuery.length > 0;
   const isFirstPage = page === 0;
@@ -563,8 +635,74 @@ function App() {
     return { all: "全部", files: "文件", dirs: "文件夹" }[t];
   }
 
+  function sortLabel(s: SortBy): string {
+    return {
+      relevance: "相关性",
+      name: "名称",
+      extension: "扩展名",
+      size: "大小",
+      modified: "修改时间",
+      added: "添加时间",
+      type: "类型",
+      source: "来源",
+      accessibility: "可访问",
+    }[s];
+  }
+
+  function selectSort(next: SortBy) {
+    setSortBy(next);
+    setSortDirection(defaultSortDirection(next));
+  }
+
+  function toggleHeaderSort(next: SortBy) {
+    if (sortBy === next) {
+      setSortDirection((dir) => (dir === "asc" ? "desc" : "asc"));
+      return;
+    }
+    setSortBy(next);
+    setSortDirection(defaultSortDirection(next));
+  }
+
+  function sortArrow(column: SortBy): string {
+    if (sortBy !== column) return "";
+    return sortDirection === "asc" ? " ▲" : " ▼";
+  }
+
+  function headerSort(column: SortBy) {
+    return sortBy === column
+      ? sortDirection === "asc"
+        ? "ascending"
+        : "descending"
+      : "none";
+  }
+
+  function SortHeader({
+    column,
+    className,
+    children,
+  }: {
+    column: SortBy;
+    className?: string;
+    children: string;
+  }) {
+    return (
+      <th className={className} aria-sort={headerSort(column)}>
+        <button
+          type="button"
+          className={`th-sort ${sortBy === column ? "is-active" : ""}`}
+          onClick={() => toggleHeaderSort(column)}
+        >
+          <span>{children}</span>
+          <span className="sort-arrow" aria-hidden="true">
+            {sortArrow(column)}
+          </span>
+        </button>
+      </th>
+    );
+  }
+
   return (
-    <div className="app">
+    <div className="app" onClick={() => setRootMenu(null)}>
       <header className="app-header">
         <h1 className="app-title">Find Profile</h1>
         <input
@@ -611,6 +749,11 @@ function App() {
                     currentRoot?.id === r.id ? "is-selected" : ""
                   }`}
                   onClick={() => setCurrentRoot(r)}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    setCurrentRoot(r);
+                    setRootMenu({ root: r, x: e.clientX, y: e.clientY });
+                  }}
                 >
                   <div className="root-path" title={r.path}>
                     {r.path}
@@ -679,6 +822,33 @@ function App() {
             <h2 className="panel-title">搜索结果</h2>
           </div>
 
+          <form
+            className="path-jump-bar"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void handleJumpToPath();
+            }}
+            aria-label="直接打开路径"
+          >
+            <label className="path-jump-field">
+              <span>路径跳转</span>
+              <input
+                type="text"
+                value={pathJumpInput}
+                onChange={(e) => setPathJumpInput(e.target.value)}
+                placeholder="粘贴 Windows 网络路径或 /Volumes/... 路径"
+                aria-label="要打开的路径"
+              />
+            </label>
+            <button
+              type="submit"
+              className="btn-jump"
+              disabled={pathJumpBusy || pathJumpInput.trim().length === 0}
+            >
+              {pathJumpBusy ? "打开中..." : "打开文件夹"}
+            </button>
+          </form>
+
           <div className="filter-bar" role="toolbar" aria-label="搜索筛选">
             <label className="filter-field">
               <span>扩展名</span>
@@ -720,15 +890,26 @@ function App() {
               <span>排序</span>
               <select
                 value={sortBy}
-                onChange={(e) => setSortBy(e.target.value as SortBy)}
+                onChange={(e) => selectSort(e.target.value as SortBy)}
                 aria-label="排序方式"
               >
                 <option value="relevance">相关性</option>
-                <option value="modified">修改时间</option>
-                <option value="size">大小</option>
                 <option value="name">名称</option>
+                <option value="extension">扩展名</option>
+                <option value="size">大小</option>
+                <option value="modified">修改时间</option>
+                <option value="added">添加时间</option>
+                <option value="type">类型</option>
+                <option value="source">来源</option>
+                <option value="accessibility">可访问</option>
               </select>
             </label>
+            {sortBy !== "relevance" && (
+              <span className="sort-chip" aria-live="polite">
+                {sortLabel(sortBy)}
+                {sortDirection === "asc" ? " ↑" : " ↓"}
+              </span>
+            )}
           </div>
 
           {!hasQuery ? (
@@ -775,6 +956,7 @@ function App() {
                     <col className="col-ext" />
                     <col className="col-size" />
                     <col className="col-modified" />
+                    <col className="col-added" />
                     <col className="col-kind" />
                     <col className="col-source" />
                     <col className="col-access" />
@@ -782,14 +964,17 @@ function App() {
                   </colgroup>
                   <thead>
                     <tr>
-                      <th>名称</th>
+                      <SortHeader column="name">名称</SortHeader>
                       <th>路径</th>
-                      <th>扩展名</th>
-                      <th className="num">大小</th>
-                      <th>修改时间</th>
-                      <th>类型</th>
-                      <th>来源</th>
-                      <th>可访问</th>
+                      <SortHeader column="extension">扩展名</SortHeader>
+                      <SortHeader column="size" className="num">
+                        大小
+                      </SortHeader>
+                      <SortHeader column="modified">修改时间</SortHeader>
+                      <SortHeader column="added">添加时间</SortHeader>
+                      <SortHeader column="type">类型</SortHeader>
+                      <SortHeader column="source">来源</SortHeader>
+                      <SortHeader column="accessibility">可访问</SortHeader>
                       <th aria-label="操作"></th>
                     </tr>
                   </thead>
@@ -811,6 +996,7 @@ function App() {
                           {formatSize(hit.size, hit.is_dir)}
                         </td>
                         <td>{formatModified(hit.modified_at)}</td>
+                        <td>{formatModified(hit.added_at)}</td>
                         <td>{hit.is_dir ? "文件夹" : "文件"}</td>
                         <td>
                           <span
@@ -1108,6 +1294,34 @@ function App() {
               )}
             </div>
           </div>
+        </div>
+      )}
+      {rootMenu && (
+        <div
+          className="root-context-menu"
+          style={{ left: rootMenu.x, top: rootMenu.y }}
+          role="menu"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              const id = rootMenu.root.id;
+              setRootMenu(null);
+              void handleScan(id);
+            }}
+          >
+            Reload
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            className="menu-danger"
+            onClick={() => void handleDeleteRoot(rootMenu.root)}
+          >
+            Delete
+          </button>
         </div>
       )}
     </div>

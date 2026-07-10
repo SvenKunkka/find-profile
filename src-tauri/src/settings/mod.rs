@@ -58,12 +58,7 @@ impl Settings {
     /// Bring user-supplied values into safe ranges. Called on every save so
     /// the frontend can pass raw input without policing it.
     pub fn sanitized(mut self) -> Self {
-        if self.search_default_limit < 1 {
-            self.search_default_limit = 1;
-        }
-        if self.search_default_limit > 1000 {
-            self.search_default_limit = 1000;
-        }
+        self.search_default_limit = self.search_default_limit.clamp(1, 1000);
         if let Some(m) = self.nas_scan_interval_minutes {
             if m < 0 {
                 self.nas_scan_interval_minutes = None;
@@ -132,11 +127,13 @@ mod tests {
     #[test]
     fn save_then_load_roundtrips() {
         let conn = init_in_memory_db().unwrap();
-        let mut s = Settings::default();
-        s.search_default_limit = 25;
-        s.show_hidden_files = true;
-        s.index_files = false;
-        s.nas_scan_interval_minutes = Some(360);
+        let s = Settings {
+            search_default_limit: 25,
+            show_hidden_files: true,
+            index_files: false,
+            nas_scan_interval_minutes: Some(360),
+            ..Settings::default()
+        };
         save(&conn, &s).unwrap();
         let loaded = load(&conn).unwrap();
         assert_eq!(loaded, s);
@@ -157,8 +154,10 @@ mod tests {
     #[test]
     fn save_overwrites_existing_row() {
         let conn = init_in_memory_db().unwrap();
-        let mut s = Settings::default();
-        s.search_default_limit = 100;
+        let mut s = Settings {
+            search_default_limit: 100,
+            ..Settings::default()
+        };
         save(&conn, &s).unwrap();
         s.search_default_limit = 200;
         save(&conn, &s).unwrap();
@@ -168,25 +167,33 @@ mod tests {
 
     #[test]
     fn sanitized_clamps_search_limit() {
-        let mut s = Settings::default();
-        s.search_default_limit = 0;
+        let s = Settings {
+            search_default_limit: 0,
+            ..Settings::default()
+        };
         assert_eq!(s.sanitized().search_default_limit, 1);
-        let mut s = Settings::default();
-        s.search_default_limit = 9999;
+        let s = Settings {
+            search_default_limit: 9999,
+            ..Settings::default()
+        };
         assert_eq!(s.sanitized().search_default_limit, 1000);
     }
 
     #[test]
     fn sanitized_drops_negative_nas_interval() {
-        let mut s = Settings::default();
-        s.nas_scan_interval_minutes = Some(-5);
+        let s = Settings {
+            nas_scan_interval_minutes: Some(-5),
+            ..Settings::default()
+        };
         assert_eq!(s.sanitized().nas_scan_interval_minutes, None);
     }
 
     #[test]
     fn sanitized_forces_keep_disconnected_index_on() {
-        let mut s = Settings::default();
-        s.keep_disconnected_nas_index = false;
+        let s = Settings {
+            keep_disconnected_nas_index: false,
+            ..Settings::default()
+        };
         assert!(s.sanitized().keep_disconnected_nas_index);
     }
 

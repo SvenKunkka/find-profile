@@ -28,6 +28,7 @@ pub fn extract_metadata(
     };
 
     let modified_at = metadata.modified().ok().and_then(system_time_to_iso);
+    let added_at = metadata.created().ok().and_then(system_time_to_iso);
 
     let extension = if is_dir {
         None
@@ -44,6 +45,7 @@ pub fn extract_metadata(
         extension,
         size,
         modified_at,
+        added_at,
         is_dir,
         source_kind,
         is_accessible: true,
